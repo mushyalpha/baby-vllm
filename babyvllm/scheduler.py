@@ -12,7 +12,7 @@ class SchedulerOutput:
     preempted_seqs: list[Sequence]
 
 class Scheduler:
-    def __init__(self, kv_cache_manager: KVCacheManager, max_num_batched_tokens: int = 8, max_num_seqs: int = 4):
+    def __init__(self, kv_cache_manager: KVCacheManager, max_num_batched_tokens: int = 2048, max_num_seqs: int = 256):
         
         
         self.kv_cache_manager = kv_cache_manager
@@ -63,21 +63,18 @@ class Scheduler:
         
         self.kv_cache_manager.free_if_allocated(seq)
 
-    def update_sequence(self, seq: Sequence):
-        if seq.generated_token_len > 0:
-            token_id = seq.last_token_id
-            if token_id in seq.sampling_params.stop_tokens:
-                self._finish(seq, SequenceFinishReason.STOP)
-            elif seq.generated_token_len >= seq.sampling_params.max_tokens:
-                self._finish(seq, SequenceFinishReason.LENGTH)
-
     def update_from_output(self, scheduler_output: SchedulerOutput, model_output: dict[int, int]):
         for seq in scheduler_output.scheduled_sequences:
             num_scheduled = scheduler_output.num_scheduled_tokens[seq.seq_id]
             seq.advance_computed(num_scheduled)
             if seq.seq_id in model_output:
-                seq.append_token(model_output[seq.seq_id])
-                self.update_sequence(seq)
+                token_id = model_output[seq.seq_id]
+                if token_id in seq.sampling_params.stop_tokens:
+                    self._finish(seq, SequenceFinishReason.STOP)
+                else:
+                    seq.append_token(token_id)
+                    if seq.generated_token_len >= seq.sampling_params.max_tokens:
+                        self._finish(seq, SequenceFinishReason.LENGTH)
 
     def schedule(self) -> SchedulerOutput:
         budget = self.max_num_batched_tokens
@@ -89,6 +86,8 @@ class Scheduler:
         running_seqs = list(self.running)
         preempted_seqs = []
         for seq in running_seqs:
+            if seq.status != SequenceState.RUNNING:
+                continue
             needed = seq.num_tokens_to_compute
             
             if budget < needed or len(scheduled_sequences) >= self.max_num_seqs:
