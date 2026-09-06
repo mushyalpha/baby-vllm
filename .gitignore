@@ -1,0 +1,11 @@
+node_modules/
+dist/
+out/
+.DS_Store
+*.log
+*.mp4
+*.webm
+*.gif
+__pycache__/
+*.py[cod]
+CODE.md
