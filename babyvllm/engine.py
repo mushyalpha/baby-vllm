@@ -114,10 +114,12 @@ class LLMEngine:
         if scheduler_output and scheduler_output.scheduled_sequences:
             for seq in scheduler_output.scheduled_sequences:
                 if seq.seq_id in sampled_tokens:
+                    token = sampled_tokens[seq.seq_id]
+                    new_ids = [] if token in seq.sampling_params.stop_tokens else [token]
                     outputs.append(
                         RequestOutput(
                             seq_id=seq.seq_id,
-                            new_token_ids=[sampled_tokens[seq.seq_id]],
+                            new_token_ids=new_ids,
                             finish_reason=seq.finish_reason,
                         )
                     )
