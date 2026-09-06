@@ -6,9 +6,6 @@ from dataclasses import dataclass, field
 class SamplingParams:
     temperature: float = 1.0
     top_p: float = 1.0
-    top_k: int = -1
-    min_tokens: int = 0
-    seed: int | None = None
     ignore_eos: bool = False
     max_tokens: int = 256
     stop_tokens: set[int] = field(default_factory=set)
