@@ -18,7 +18,7 @@ class Sampler(nn.Module):
         sampled_tokens = {}
         for i, seq in enumerate(scheduler_output.scheduled_sequences):
             params = seq.sampling_params
-            logit = logits[i]
+            logit = logits[i].float()
             
             if params is None or params.temperature == 0.0:
                 token = torch.argmax(logit).item()
