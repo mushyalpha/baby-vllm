@@ -5,29 +5,60 @@ from babyvllm.worker.context import AttentionMetadata, set_forward_context
 from babyvllm.layers.sampler import Sampler
 
 class ModelRunner:
-    def __init__(self, model_config, num_blocks: int = 100):
+    def __init__(self, model_config, cache_config=None, scheduler_config=None):
         self.model_config = model_config
-        self.num_blocks = num_blocks
-        self.block_size = getattr(model_config, 'block_size', 16)
+        self.cache_config = cache_config
+        self.scheduler_config = scheduler_config
+        self.block_size = cache_config.block_size if cache_config else getattr(model_config, 'block_size', 16)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
         
         torch.set_default_dtype(self.dtype)
-        self.model = Qwen2ForCausalLM(model_config).to(self.device)
+        with torch.device(self.device):
+            self.model = Qwen2ForCausalLM(model_config)
         self.model.eval()
         torch.set_default_dtype(torch.float32)
 
         self.sampler = Sampler(model_config.vocab_size).to(self.device)
+        
+        self.num_blocks = self.determine_num_blocks()
         
         num_kv_heads = model_config.num_key_value_heads
         head_dim = model_config.hidden_size // model_config.num_attention_heads
         
         for module in self.model.modules():
             if isinstance(module, Attention):
-                module.kv_cache = torch.empty(2, num_blocks, self.block_size, num_kv_heads, head_dim, dtype=self.dtype, device=self.device)
+                module.kv_cache = torch.empty(2, self.num_blocks, self.block_size, num_kv_heads, head_dim, dtype=self.dtype, device=self.device)
         
     def determine_num_blocks(self) -> int:
-        return self.num_blocks
+        if self.device.type != "cuda":
+            return self.cache_config.num_cpu_blocks if self.cache_config else 100
+            
+        torch.cuda.reset_peak_memory_stats()
+        
+        max_batched_tokens = self.scheduler_config.max_num_batched_tokens if self.scheduler_config else 2048
+        
+        dummy_input = torch.zeros(max_batched_tokens, dtype=torch.int64, device=self.device)
+        dummy_positions = torch.arange(max_batched_tokens, dtype=torch.int64, device=self.device)
+        
+        with torch.inference_mode():
+            hidden_states = self.model(dummy_input, dummy_positions)
+            _ = self.model.compute_logits(hidden_states)
+            
+        peak_memory = torch.cuda.max_memory_allocated()
+        total_memory = torch.cuda.get_device_properties(self.device).total_memory
+        
+        utilization = 0.9
+        available_for_kv = total_memory * utilization - peak_memory
+        
+        head_dim = self.model_config.hidden_size // self.model_config.num_attention_heads
+        bytes_per_element = 2 if self.dtype in (torch.float16, torch.bfloat16) else 4
+        
+        bytes_per_token = 2 * self.model_config.num_key_value_heads * head_dim * self.model_config.num_hidden_layers * bytes_per_element
+        bytes_per_block = bytes_per_token * self.block_size
+        
+        num_blocks = int(available_for_kv / bytes_per_block)
+        return max(1, num_blocks)
 
     def prepare_inputs(self, scheduler_output) -> tuple[torch.Tensor, torch.Tensor, AttentionMetadata]:
         slot_mapping = []
