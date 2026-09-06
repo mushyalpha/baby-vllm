@@ -1,20 +1,47 @@
 # Baby-vLLM
 
-Interactive diagram of a vLLM V1 engine step: continuous batching, mixed prefill/decode, KV pressure, preemption, and block reuse.
+A lightweight vLLM-style inference engine built from scratch.
+
+## Key Features
+
+* **Continuous batching**. Mix prefills and decodes in the same step
+* **Lean codebase**. Clean implementation in ~1,400 lines of Python
+* **Paged KV cache**. Block allocation, preemption, recompute when memory is tight
+
+## Installation
 
 ```bash
-npm start
+pip install git+https://github.com/mushyalpha/baby-vllm.git
 ```
 
-## Architecture Notes
+## Model Download
 
-### Paged Attention KV Cache Allocation
+To download the model weights manually:
 
-In `PagedAttention`, the current implementation performs an advanced-index copy of the whole sequence KV into a newly allocated tensor:
+```bash
+huggingface-cli download --resume-download Qwen/Qwen2-0.5B \
+  --local-dir ~/huggingface/Qwen2-0.5B/ \
+  --local-dir-use-symlinks False
+```
+
+## Quick Start
+
+See `example.py` for usage. The API mirrors vLLM's interface:
 
 ```python
-k_i = kv_cache[0][blocks].view(-1, num_kv_heads, head_dim)[:seq_len]
-v_i = kv_cache[1][blocks].view(-1, num_kv_heads, head_dim)[:seq_len]
+from babyvllm import LLM, SamplingParams
+
+llm = LLM("Qwen/Qwen2-0.5B")
+sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
+prompts = ["Hello, Baby-vLLM."]
+outputs = llm.generate(prompts, sampling_params)
+outputs[0].text
 ```
 
-While functionally correct for a v1 implementation to test the engine, **this allocation-heavy pattern is the primary reason FlashAttention's paged kernel exists in production vLLM.** The custom CUDA kernel in vLLM reads directly from the disjoint block tables during attention computation without needing to materialize a contiguous tensor in HBM.
+## Benchmark
+
+`benchmarks/benchmark_throughput.py` for a HuggingFace vs Baby-vLLM throughput comparison.
+
+```bash
+python benchmarks/benchmark_throughput.py
+```

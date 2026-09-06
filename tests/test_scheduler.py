@@ -50,7 +50,10 @@ class FakeModelRunner:
             sampled_tokens[seq.seq_id] = token
         return sampled_tokens
 
+import itertools
+
 def run_stress_test(num_blocks):
+    Sequence._counter = itertools.count()
     runner = FakeModelRunner(block_size=4)
     runner.num_blocks = num_blocks
     engine = LLMEngine(model_runner=runner, max_num_batched_tokens=32, max_num_seqs=8)

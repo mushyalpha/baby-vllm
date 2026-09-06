@@ -1,10 +1,11 @@
+import os
 import torch
 from transformers import AutoTokenizer
 from huggingface_hub import snapshot_download
 
 from babyvllm.config import ModelConfig, CacheConfig, SchedulerConfig
 from babyvllm.engine import LLMEngine
-from babyvllm.worker.model_runner import ModelRunner
+from babyvllm.worker.model_runner import ModelRunner, pick_device
 from babyvllm.worker.loader import load_model
 from babyvllm.sequence import SamplingParams
 
@@ -13,9 +14,14 @@ class LLM:
         self,
         model_name: str,
         cache_config: CacheConfig = None,
-        scheduler_config: SchedulerConfig = None
+        scheduler_config: SchedulerConfig = None,
+        device=None,
+        verbose: bool = False,
     ):
         self.model_name = model_name
+        self.verbose = verbose
+        device = torch.device(device) if device is not None else pick_device()
+        self._log(f"Loading {model_name} on {device}...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         
         try:
@@ -33,7 +39,12 @@ class LLM:
             else:
                 self.eos_token_id = set()
         
-        path = snapshot_download(repo_id=model_name)
+        if os.path.isdir(model_name):
+            path = model_name
+        else:
+            self._log("Downloading / resolving checkpoint...")
+            path = snapshot_download(repo_id=model_name)
+            self._log(f"Checkpoint ready at {path}")
         
         import json
         with open(f"{path}/config.json", "r") as f:
@@ -54,11 +65,14 @@ class LLM:
         
         sched_cfg = scheduler_config or SchedulerConfig()
         
+        self._log("Building model...")
         self.model_runner = ModelRunner(
             self.model_config,
             cache_config=cache_config,
-            scheduler_config=sched_cfg
+            scheduler_config=sched_cfg,
+            device=device,
         )
+        self._log("Loading weights...")
         load_model(self.model_runner.model, path)
         
         self.engine = LLMEngine(
@@ -66,6 +80,11 @@ class LLM:
             max_num_batched_tokens=sched_cfg.max_num_batched_tokens,
             max_num_seqs=sched_cfg.max_num_seqs
         )
+        self._log("Engine ready.")
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(msg, flush=True)
 
     def generate(self, prompts: list[str], sampling_params=None):
         import copy

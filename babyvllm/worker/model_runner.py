@@ -4,14 +4,31 @@ from babyvllm.models.qwen2 import Qwen2ForCausalLM
 from babyvllm.worker.context import AttentionMetadata, set_forward_context
 from babyvllm.layers.sampler import Sampler
 
+
+def pick_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def pick_dtype(device: torch.device) -> torch.dtype:
+    if device.type == "cuda":
+        return torch.bfloat16
+    if device.type == "mps":
+        return torch.float16
+    return torch.float32
+
+
 class ModelRunner:
-    def __init__(self, model_config, cache_config=None, scheduler_config=None):
+    def __init__(self, model_config, cache_config=None, scheduler_config=None, device=None):
         self.model_config = model_config
         self.cache_config = cache_config
         self.scheduler_config = scheduler_config
         self.block_size = cache_config.block_size if cache_config else getattr(model_config, 'block_size', 16)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        self.device = torch.device(device) if device is not None else pick_device()
+        self.dtype = pick_dtype(self.device)
         
         torch.set_default_dtype(self.dtype)
         with torch.device(self.device):
