@@ -14,6 +14,7 @@ class RequestOutput:
     seq_id: int
     new_token_ids: list[int]
     finish_reason: SequenceFinishReason | None = None
+    text: str = ""
 
     @property
     def finished(self) -> bool:
@@ -61,7 +62,9 @@ class LLMEngine:
         return seq.seq_id
 
     def abort_request(self, seq_id: int) -> None:
-        seq = self.sequences[seq_id]
+        seq = self.sequences.get(seq_id)
+        if seq is None:
+            return
 
         if not seq.is_finished:
             self.scheduler.abort_seq(seq)
@@ -74,6 +77,7 @@ class LLMEngine:
             return []
 
         scheduler_output = None
+        sampled_tokens = {}
         if self.has_unfinished_requests():
             scheduler_output = self.scheduler.schedule()
 
@@ -106,8 +110,6 @@ class LLMEngine:
 
         outputs = []
         handled_seq_ids = set()
-
-        sampled_tokens = sampled_tokens if 'sampled_tokens' in locals() else {}
         
         if scheduler_output and scheduler_output.scheduled_sequences:
             for seq in scheduler_output.scheduled_sequences:
