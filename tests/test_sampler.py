@@ -1,5 +1,10 @@
 import torch
 import torch.nn.functional as F
+from unittest.mock import patch
+from dataclasses import dataclass
+
+from babyvllm.layers.sampler import Sampler
+from babyvllm.sequence import Sequence, SamplingParams
 
 def brute_force_top_p(probs: torch.Tensor, top_p: float) -> torch.Tensor:
     sorted_probs, sorted_indices = torch.sort(probs, descending=True)
@@ -18,40 +23,52 @@ def brute_force_top_p(probs: torch.Tensor, top_p: float) -> torch.Tensor:
         
     return out_probs / out_probs.sum()
 
-def get_vllm_top_p_probs(probs: torch.Tensor, top_p: float) -> torch.Tensor:
-    probs = probs.clone()
-    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-    
-    sorted_indices_to_remove = cumulative_probs > top_p
-    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-    sorted_indices_to_remove[..., 0] = 0
-    
-    indices_to_remove = sorted_indices[sorted_indices_to_remove]
-    probs[indices_to_remove] = 0.0
-    probs = probs / probs.sum()
-    return probs
+@dataclass
+class MockSchedulerOutput:
+    scheduled_sequences: list
 
 def test_top_p_sampling():
     torch.manual_seed(42)
+    sampler = Sampler(vocab_size=1000)
+    
     for _ in range(100):
-        logits = torch.randn(1000)
+        logits = torch.randn(1, 1000)
         probs = F.softmax(logits, dim=-1)
         
         top_p = torch.rand(1).item() * 0.9 + 0.1
+        expected = brute_force_top_p(probs[0], top_p)
         
-        expected = brute_force_top_p(probs, top_p)
-        actual = get_vllm_top_p_probs(probs, top_p)
+        seq = Sequence([1], sampling_params=SamplingParams(top_p=top_p, temperature=1.0))
+        scheduler_out = MockSchedulerOutput([seq])
         
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
-        
+        with patch("torch.multinomial") as mock_multinomial:
+            mock_multinomial.return_value = torch.tensor([[0]])
+            sampler(logits, None, scheduler_out)
+            actual_probs = mock_multinomial.call_args[0][0]
+            
+        torch.testing.assert_close(actual_probs, expected, rtol=1e-5, atol=1e-5)
+
 def test_top_p_edge_cases():
-    probs = torch.tensor([0.4, 0.3, 0.2, 0.1])
+    sampler = Sampler(vocab_size=4)
+    probs = torch.tensor([[0.4, 0.3, 0.2, 0.1]])
+    logits = torch.log(probs)
     
-    expected = brute_force_top_p(probs, 0.1)
-    actual = get_vllm_top_p_probs(probs, 0.1)
+    # top_p = 0.1
+    expected = brute_force_top_p(probs[0], 0.1)
+    seq = Sequence([1], sampling_params=SamplingParams(top_p=0.1, temperature=1.0))
+    scheduler_out = MockSchedulerOutput([seq])
+    with patch("torch.multinomial") as mock_multinomial:
+        mock_multinomial.return_value = torch.tensor([[0]])
+        sampler(logits, None, scheduler_out)
+        actual = mock_multinomial.call_args[0][0]
     torch.testing.assert_close(actual, expected)
     
-    expected = brute_force_top_p(probs, 1.0)
-    actual = get_vllm_top_p_probs(probs, 1.0)
+    # top_p = 1.0
+    expected = brute_force_top_p(probs[0], 1.0)
+    seq = Sequence([1], sampling_params=SamplingParams(top_p=1.0, temperature=1.0))
+    scheduler_out = MockSchedulerOutput([seq])
+    with patch("torch.multinomial") as mock_multinomial:
+        mock_multinomial.return_value = torch.tensor([[0]])
+        sampler(logits, None, scheduler_out)
+        actual = mock_multinomial.call_args[0][0]
     torch.testing.assert_close(actual, expected)
