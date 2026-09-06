@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/baby_vllm_logo.jpg" alt="Baby-vLLM logo" width="400">
+</p>
+
 # Baby-vLLM
 
 A lightweight vLLM-style inference engine built from scratch.
