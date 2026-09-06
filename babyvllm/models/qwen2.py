@@ -76,7 +76,7 @@ class Qwen2Model(nn.Module):
 
     def forward(self, input_ids, positions):
         x = self.embed_tokens(input_ids)
-        cos, sin = self.rotary_emb(positions)
+        cos, sin = self.rotary_emb(positions, x.dtype)
         for layer in self.layers:
             x = layer(x, cos, sin)
         x = self.norm(x)
