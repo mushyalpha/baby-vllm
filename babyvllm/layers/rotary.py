@@ -26,7 +26,7 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
 
-    def forward(self, positions: torch.Tensor):
-        cos = self.cos_cached[0, 0, positions]
-        sin = self.sin_cached[0, 0, positions]
+    def forward(self, positions: torch.Tensor, dtype: torch.dtype):
+        cos = self.cos_cached[0, 0, positions].to(dtype)
+        sin = self.sin_cached[0, 0, positions].to(dtype)
         return cos, sin
