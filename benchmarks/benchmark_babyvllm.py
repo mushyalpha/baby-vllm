@@ -158,6 +158,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vs-hf", action="store_true", help="Also time sequential HuggingFace")
     p.add_argument("--quick", action="store_true")
     p.add_argument("--nsys-focus", action="store_true")
+    p.add_argument(
+        "--chrome-trace",
+        default=None,
+        help="Write a Chrome/Perfetto trace of the last sweep point (no nsys needed)",
+    )
     p.add_argument("--out", default="babyvllm_bench.json")
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
@@ -216,9 +221,23 @@ def main() -> int:
     run_once(llm, prompts[: min(2, len(prompts))], gen_lens[: min(2, len(prompts))], max_num_seqs=1)
 
     results = []
-    for n_seqs in parse_int_list(args.seqs):
+    seq_points = parse_int_list(args.seqs)
+    for i, n_seqs in enumerate(seq_points):
         print(f"\n--- baby-vLLM max_num_seqs={n_seqs} ---", flush=True)
-        row = run_once(llm, prompts, gen_lens, max_num_seqs=n_seqs)
+        use_trace = args.chrome_trace and i == len(seq_points) - 1
+        if use_trace:
+            from torch.profiler import ProfilerActivity, profile
+
+            print(f"Recording Chrome trace → {args.chrome_trace}", flush=True)
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=False,
+            ) as prof:
+                row = run_once(llm, prompts, gen_lens, max_num_seqs=n_seqs)
+            prof.export_chrome_trace(args.chrome_trace)
+            print(f"Wrote {os.path.abspath(args.chrome_trace)}", flush=True)
+        else:
+            row = run_once(llm, prompts, gen_lens, max_num_seqs=n_seqs)
         results.append(row)
         print(
             f"  {row['tok_s']:.1f} tok/s  "
