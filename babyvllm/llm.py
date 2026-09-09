@@ -74,7 +74,20 @@ class LLM:
         )
         self._log("Loading weights...")
         load_model(self.model_runner.model, path)
-        
+
+        num_blocks = self.model_runner.allocate_kv_cache()
+        profile = self.model_runner.kv_profile or {}
+        if "peak_memory_gb" in profile:
+            self._log(
+                f"KV profile: peak {profile['peak_memory_gb']:.2f} GB / "
+                f"{profile['total_memory_gb']:.2f} GB, "
+                f"{profile['available_for_kv_gb']:.2f} GB free for cache → "
+                f"{num_blocks} blocks "
+                f"({profile['max_kv_tokens']} tokens)"
+            )
+        else:
+            self._log(f"KV cache: {num_blocks} blocks (CPU/MPS fallback)")
+
         self.engine = LLMEngine(
             model_runner=self.model_runner,
             max_num_batched_tokens=sched_cfg.max_num_batched_tokens,
