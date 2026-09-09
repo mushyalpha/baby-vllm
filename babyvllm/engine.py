@@ -7,6 +7,7 @@ from babyvllm.sequence import (
 )
 from babyvllm.scheduler import Scheduler, SchedulerOutput
 from babyvllm.kv_cache_manager import KVCacheManager
+from babyvllm.worker.model_runner import nvtx_range
 
 
 @dataclass
@@ -29,9 +30,12 @@ class LLMEngine:
         max_num_seqs: int = 4,
     ):
         self.model_runner = model_runner
+        num_blocks = getattr(model_runner, "num_blocks", None)
+        if not num_blocks:
+            num_blocks = model_runner.determine_num_blocks()
 
         self.kv_cache_manager = KVCacheManager(
-            num_blocks=model_runner.determine_num_blocks(),
+            num_blocks=num_blocks,
             block_size=model_runner.block_size,
         )
 
@@ -79,7 +83,8 @@ class LLMEngine:
         scheduler_output = None
         sampled_tokens = {}
         if self.has_unfinished_requests():
-            scheduler_output = self.scheduler.schedule()
+            with nvtx_range("schedule"):
+                scheduler_output = self.scheduler.schedule()
 
             made_progress = (
                 bool(scheduler_output.scheduled_sequences) or 
@@ -103,10 +108,11 @@ class LLMEngine:
                         "ModelRunner returned incorrect type"
                     )
 
-                self.scheduler.update_from_output(
-                    scheduler_output,
-                    sampled_tokens,
-                )
+                with nvtx_range("update"):
+                    self.scheduler.update_from_output(
+                        scheduler_output,
+                        sampled_tokens,
+                    )
 
         outputs = []
         handled_seq_ids = set()
@@ -138,7 +144,7 @@ class LLMEngine:
 
         return outputs
 
-    def run(self, max_steps: int = 1000) -> dict[int, RequestOutput]:
+    def run(self, max_steps: int = 100_000) -> dict[int, RequestOutput]:
         steps = 0
         final_outputs: dict[int, RequestOutput] = {}
         
