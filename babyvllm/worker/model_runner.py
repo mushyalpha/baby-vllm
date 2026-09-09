@@ -87,18 +87,25 @@ class ModelRunner:
         with torch.inference_mode():
             hidden_states = self.model(dummy_input, dummy_positions)
             _ = self.model.compute_logits(hidden_states)
+            del hidden_states
 
         torch.cuda.synchronize()
+        torch.cuda.empty_cache()
         peak_memory = torch.cuda.max_memory_allocated()
-        total_memory = torch.cuda.get_device_properties(self.device).total_memory
+        allocated = torch.cuda.memory_allocated()
+        free_bytes, total_memory = torch.cuda.mem_get_info()
         utilization = 0.9
-        available_for_kv = total_memory * utilization - peak_memory
+        slack = 256 * 1024 * 1024
+        budget = int(total_memory * utilization) - allocated
+        available_for_kv = min(budget, int(free_bytes) - slack)
         bytes_per_token = self._bytes_per_token()
         bytes_per_block = bytes_per_token * self.block_size
         num_blocks = max(1, int(available_for_kv / bytes_per_block)) if available_for_kv > 0 else 1
 
         self.kv_profile = {
             "peak_memory_gb": peak_memory / 1e9,
+            "allocated_gb": allocated / 1e9,
+            "free_memory_gb": free_bytes / 1e9,
             "total_memory_gb": total_memory / 1e9,
             "utilization": utilization,
             "available_for_kv_gb": max(0.0, available_for_kv) / 1e9,
@@ -109,25 +116,43 @@ class ModelRunner:
         }
         return num_blocks
 
-    def allocate_kv_cache(self) -> int:
-        """Profile free memory, then allocate the paged KV pool once."""
-        if self.num_blocks is not None:
-            return self.num_blocks
-
-        self.num_blocks = self.determine_num_blocks()
+    def _alloc_kv_tensors(self, num_blocks: int) -> None:
         num_kv_heads = self.model_config.num_key_value_heads
         head_dim = self.model_config.hidden_size // self.model_config.num_attention_heads
         for module in self.model.modules():
             if isinstance(module, Attention):
                 module.kv_cache = torch.empty(
                     2,
-                    self.num_blocks,
+                    num_blocks,
                     self.block_size,
                     num_kv_heads,
                     head_dim,
                     dtype=self.dtype,
                     device=self.device,
                 )
+
+    def allocate_kv_cache(self) -> int:
+        """Profile free memory, then allocate the paged KV pool once."""
+        if self.num_blocks is not None:
+            return self.num_blocks
+
+        self.num_blocks = self.determine_num_blocks()
+        while True:
+            try:
+                self._alloc_kv_tensors(self.num_blocks)
+                break
+            except torch.cuda.OutOfMemoryError:
+                for module in self.model.modules():
+                    if isinstance(module, Attention):
+                        module.kv_cache = None
+                torch.cuda.empty_cache()
+                if self.num_blocks <= 1:
+                    raise
+                self.num_blocks = max(1, self.num_blocks // 2)
+                if self.kv_profile is not None:
+                    self.kv_profile["num_blocks"] = self.num_blocks
+                    self.kv_profile["max_kv_tokens"] = self.num_blocks * self.block_size
+                    self.kv_profile["oom_backoff"] = True
         return self.num_blocks
 
     def prepare_inputs(self, scheduler_output) -> tuple[torch.Tensor, torch.Tensor, AttentionMetadata]:
