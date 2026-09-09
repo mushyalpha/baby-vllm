@@ -3,8 +3,6 @@ import os
 import sys
 import time
 
-# python3 benchmarks/benchmark_throughput.py puts `benchmarks/` on sys.path,
-# not the repo root — so `import babyvllm` fails without this.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import torch
