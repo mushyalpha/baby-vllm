@@ -1,8 +1,22 @@
+from contextlib import contextmanager
+
 import torch
 from babyvllm.layers.attention import Attention
 from babyvllm.models.qwen2 import Qwen2ForCausalLM
 from babyvllm.worker.context import AttentionMetadata, set_forward_context
 from babyvllm.layers.sampler import Sampler
+
+
+@contextmanager
+def nvtx_range(name: str):
+    enabled = torch.cuda.is_available()
+    if enabled:
+        torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        if enabled:
+            torch.cuda.nvtx.range_pop()
 
 
 def pick_device() -> torch.device:
@@ -37,45 +51,84 @@ class ModelRunner:
         torch.set_default_dtype(torch.float32)
 
         self.sampler = Sampler(model_config.vocab_size).to(self.device)
-        
-        self.num_blocks = self.determine_num_blocks()
-        
-        num_kv_heads = model_config.num_key_value_heads
-        head_dim = model_config.hidden_size // model_config.num_attention_heads
-        
-        for module in self.model.modules():
-            if isinstance(module, Attention):
-                module.kv_cache = torch.empty(2, self.num_blocks, self.block_size, num_kv_heads, head_dim, dtype=self.dtype, device=self.device)
-        
+        self.num_blocks: int | None = None
+        self.kv_profile: dict | None = None
+
+    def _bytes_per_token(self) -> int:
+        head_dim = self.model_config.hidden_size // self.model_config.num_attention_heads
+        bytes_per_element = 2 if self.dtype in (torch.float16, torch.bfloat16) else 4
+        return (
+            2
+            * self.model_config.num_key_value_heads
+            * head_dim
+            * self.model_config.num_hidden_layers
+            * bytes_per_element
+        )
+
     def determine_num_blocks(self) -> int:
         if self.device.type != "cuda":
-            return self.cache_config.num_cpu_blocks if self.cache_config else 100
-            
+            num_blocks = self.cache_config.num_cpu_blocks if self.cache_config else 100
+            self.kv_profile = {
+                "num_blocks": num_blocks,
+                "block_size": self.block_size,
+                "bytes_per_token": self._bytes_per_token(),
+            }
+            return num_blocks
+
         torch.cuda.reset_peak_memory_stats()
-        
-        max_batched_tokens = self.scheduler_config.max_num_batched_tokens if self.scheduler_config else 2048
-        
+        torch.cuda.empty_cache()
+
+        max_batched_tokens = (
+            self.scheduler_config.max_num_batched_tokens if self.scheduler_config else 2048
+        )
         dummy_input = torch.zeros(max_batched_tokens, dtype=torch.int64, device=self.device)
         dummy_positions = torch.arange(max_batched_tokens, dtype=torch.int64, device=self.device)
-        
+
         with torch.inference_mode():
             hidden_states = self.model(dummy_input, dummy_positions)
             _ = self.model.compute_logits(hidden_states)
-            
+
+        torch.cuda.synchronize()
         peak_memory = torch.cuda.max_memory_allocated()
         total_memory = torch.cuda.get_device_properties(self.device).total_memory
-        
         utilization = 0.9
         available_for_kv = total_memory * utilization - peak_memory
-        
-        head_dim = self.model_config.hidden_size // self.model_config.num_attention_heads
-        bytes_per_element = 2 if self.dtype in (torch.float16, torch.bfloat16) else 4
-        
-        bytes_per_token = 2 * self.model_config.num_key_value_heads * head_dim * self.model_config.num_hidden_layers * bytes_per_element
+        bytes_per_token = self._bytes_per_token()
         bytes_per_block = bytes_per_token * self.block_size
-        
-        num_blocks = int(available_for_kv / bytes_per_block)
-        return max(1, num_blocks)
+        num_blocks = max(1, int(available_for_kv / bytes_per_block)) if available_for_kv > 0 else 1
+
+        self.kv_profile = {
+            "peak_memory_gb": peak_memory / 1e9,
+            "total_memory_gb": total_memory / 1e9,
+            "utilization": utilization,
+            "available_for_kv_gb": max(0.0, available_for_kv) / 1e9,
+            "bytes_per_token": bytes_per_token,
+            "block_size": self.block_size,
+            "num_blocks": num_blocks,
+            "max_kv_tokens": num_blocks * self.block_size,
+        }
+        return num_blocks
+
+    def allocate_kv_cache(self) -> int:
+        """Profile free memory, then allocate the paged KV pool once."""
+        if self.num_blocks is not None:
+            return self.num_blocks
+
+        self.num_blocks = self.determine_num_blocks()
+        num_kv_heads = self.model_config.num_key_value_heads
+        head_dim = self.model_config.hidden_size // self.model_config.num_attention_heads
+        for module in self.model.modules():
+            if isinstance(module, Attention):
+                module.kv_cache = torch.empty(
+                    2,
+                    self.num_blocks,
+                    self.block_size,
+                    num_kv_heads,
+                    head_dim,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+        return self.num_blocks
 
     def prepare_inputs(self, scheduler_output) -> tuple[torch.Tensor, torch.Tensor, AttentionMetadata]:
         slot_mapping = []
@@ -145,14 +198,16 @@ class ModelRunner:
 
     @torch.inference_mode()
     def execute_model(self, scheduler_output) -> dict[int, int]:
-        input_ids, positions, attn_metadata = self.prepare_inputs(scheduler_output)
-        
-        with set_forward_context(attn_metadata):
+        with nvtx_range("prepare_inputs"):
+            input_ids, positions, attn_metadata = self.prepare_inputs(scheduler_output)
+
+        with nvtx_range("forward"), set_forward_context(attn_metadata):
             hidden_states = self.model(input_ids, positions)
-            
+
         last_indices = [end - 1 for end in attn_metadata.query_start_loc_cpu[1:]]
         hidden_states = hidden_states[last_indices]
-            
-        logits = self.model.compute_logits(hidden_states)
-        sampled_tokens = self.sampler(logits, attn_metadata, scheduler_output)
+
+        with nvtx_range("sample"):
+            logits = self.model.compute_logits(hidden_states)
+            sampled_tokens = self.sampler(logits, attn_metadata, scheduler_output)
         return sampled_tokens
