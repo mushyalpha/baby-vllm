@@ -17,6 +17,7 @@ class LLM:
         scheduler_config: SchedulerConfig = None,
         device=None,
         verbose: bool = False,
+        use_cuda_graphs: bool | None = None,
     ):
         self.model_name = model_name
         self.verbose = verbose
@@ -71,6 +72,7 @@ class LLM:
             cache_config=cache_config,
             scheduler_config=sched_cfg,
             device=device,
+            use_cuda_graphs=use_cuda_graphs,
         )
         self._log("Loading weights...")
         load_model(self.model_runner.model, path)
@@ -93,6 +95,8 @@ class LLM:
             max_num_batched_tokens=sched_cfg.max_num_batched_tokens,
             max_num_seqs=sched_cfg.max_num_seqs
         )
+        if self.model_runner.use_cuda_graphs:
+            self._log("CUDA graphs enabled for decode")
         self._log("Engine ready.")
 
     def _log(self, msg: str) -> None:

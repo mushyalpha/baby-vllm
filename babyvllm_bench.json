@@ -1,0 +1,88 @@
+{
+  "model": "Qwen/Qwen2-0.5B",
+  "device": "cuda",
+  "kv_profile": {
+    "peak_memory_gb": 1.698507264,
+    "total_memory_gb": 25.261047808,
+    "utilization": 0.9,
+    "available_for_kv_gb": 21.0364357632,
+    "bytes_per_token": 12288,
+    "block_size": 16,
+    "num_blocks": 106996,
+    "max_kv_tokens": 1711936
+  },
+  "workload": {
+    "num_requests": 32,
+    "prompt_len": 128,
+    "max_tokens": 64,
+    "mixed": false
+  },
+  "babyvllm": [
+    {
+      "max_num_seqs": 1,
+      "requests": 32,
+      "steps": 2048,
+      "gen_tokens": 2048,
+      "elapsed_s": 52.15885853674263,
+      "tok_s": 39.264662944211345,
+      "ttft_p50_ms": 25662.65404270962,
+      "ttft_p99_ms": 50095.67053232343,
+      "itl_p50_ms": 25.434386916458607,
+      "itl_p99_ms": 27.87680248729884
+    },
+    {
+      "max_num_seqs": 4,
+      "requests": 32,
+      "steps": 512,
+      "gen_tokens": 2048,
+      "elapsed_s": 26.669699197635055,
+      "tok_s": 76.79126730389247,
+      "ttft_p50_ms": 11805.613399483263,
+      "ttft_p99_ms": 23372.23115283996,
+      "itl_p50_ms": 51.88408447429538,
+      "itl_p99_ms": 64.74555563181639
+    },
+    {
+      "max_num_seqs": 8,
+      "requests": 32,
+      "steps": 256,
+      "gen_tokens": 2048,
+      "elapsed_s": 22.40323346387595,
+      "tok_s": 91.41537552167608,
+      "ttft_p50_ms": 8541.457124520093,
+      "ttft_p99_ms": 16958.592815324664,
+      "itl_p50_ms": 87.85124216228724,
+      "itl_p99_ms": 90.01461789011955
+    },
+    {
+      "max_num_seqs": 16,
+      "requests": 32,
+      "steps": 128,
+      "gen_tokens": 2048,
+      "elapsed_s": 20.13819700293243,
+      "tok_s": 101.69728698660461,
+      "ttft_p50_ms": 5168.735226150602,
+      "ttft_p99_ms": 10182.696613483131,
+      "itl_p50_ms": 156.99656261131167,
+      "itl_p99_ms": 164.43168371915817
+    },
+    {
+      "max_num_seqs": 32,
+      "requests": 32,
+      "steps": 66,
+      "gen_tokens": 2048,
+      "elapsed_s": 19.141455933451653,
+      "tok_s": 106.99290624078968,
+      "ttft_p50_ms": 300.9220091626048,
+      "ttft_p99_ms": 655.2783877775076,
+      "itl_p50_ms": 298.6105429008603,
+      "itl_p99_ms": 306.0389580205083
+    }
+  ],
+  "huggingface_sequential": {
+    "engine": "huggingface_sequential",
+    "gen_tokens": 2048,
+    "elapsed_s": 37.03202414792031,
+    "tok_s": 55.30348521645728
+  }
+}

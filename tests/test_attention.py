@@ -82,6 +82,58 @@ def test_prefill_then_decode_parity():
         
     torch.testing.assert_close(actual_decode[0], expected[10], atol=1e-5, rtol=1e-5)
 
+
+def test_batched_decode():
+    num_heads = 4
+    num_kv_heads = 2
+    head_dim = 16
+    block_size = 4
+
+    attn = Attention(num_heads, head_dim, num_kv_heads)
+
+    q0 = torch.randn(7, num_heads, head_dim)
+    k0 = torch.randn(7, num_kv_heads, head_dim)
+    v0 = torch.randn(7, num_kv_heads, head_dim)
+    q1 = torch.randn(6, num_heads, head_dim)
+    k1 = torch.randn(6, num_kv_heads, head_dim)
+    v1 = torch.randn(6, num_kv_heads, head_dim)
+
+    exp0 = _naive_causal_attention(q0, k0, v0, attn.scale, attn.num_queries_per_kv)
+    exp1 = _naive_causal_attention(q1, k1, v1, attn.scale, attn.num_queries_per_kv)
+
+    kv_cache = torch.empty(2, 8, block_size, num_kv_heads, head_dim)
+    attn.kv_cache = kv_cache
+
+    store_kvcache(k0[:6], v0[:6], kv_cache, torch.arange(6))
+    store_kvcache(k1[:5], v1[:5], kv_cache, torch.arange(16, 21))
+
+    q = torch.cat([q0[6:7], q1[5:6]], dim=0)
+    k = torch.cat([k0[6:7], k1[5:6]], dim=0)
+    v = torch.cat([v0[6:7], v1[5:6]], dim=0)
+
+    md = AttentionMetadata(
+        slot_mapping=torch.tensor([6, 21]),
+        block_tables=torch.tensor([
+            [0, 1],
+            [4, 5],
+        ], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        seq_lens=torch.tensor([7, 6], dtype=torch.int32),
+        context_lens=torch.tensor([6, 5], dtype=torch.int32),
+        query_start_loc_cpu=[0, 1, 2],
+        seq_lens_cpu=[7, 6],
+        context_lens_cpu=[6, 5],
+        max_query_len=1,
+        max_seq_len=7,
+    )
+
+    with set_forward_context(md):
+        actual = attn(q, k, v)
+
+    torch.testing.assert_close(actual[0], exp0[6], atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(actual[1], exp1[5], atol=1e-5, rtol=1e-5)
+
+
 def test_batched_mixed():
     num_heads = 4
     num_kv_heads = 2
@@ -200,6 +252,7 @@ def test_non_contiguous():
 if __name__ == "__main__":
     test_prefill_parity()
     test_prefill_then_decode_parity()
+    test_batched_decode()
     test_batched_mixed()
     test_non_contiguous()
     print("All attention tests passed!")

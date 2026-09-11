@@ -8,4 +8,4 @@ out/
 *.gif
 __pycache__/
 *.py[cod]
-CODE.md
+CODE.md*.nsys-rep
