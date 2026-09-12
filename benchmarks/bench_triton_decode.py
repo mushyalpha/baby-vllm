@@ -33,7 +33,16 @@ def prompt_ids(tokenizer, length: int) -> list[int]:
     return out[:length]
 
 
+def _all_in_decode(llm: LLM, batch: int) -> bool:
+    running = llm.engine.scheduler.running
+    waiting = llm.engine.scheduler.waiting
+    if waiting or len(running) < batch:
+        return False
+    return all(seq.generated_token_len >= 1 for seq in running)
+
+
 def time_point(llm: LLM, batch: int, ctx: int) -> None:
+    print(f"timing B={batch} ctx={ctx} ...", flush=True)
     tok = llm.tokenizer
     prompts = [prompt_ids(tok, ctx) for _ in range(batch)]
     llm.engine.reset()
@@ -45,10 +54,10 @@ def time_point(llm: LLM, batch: int, ctx: int) -> None:
             SamplingParams(temperature=0.0, max_tokens=GEN, ignore_eos=True),
         )
 
-    # First step is prefill (and graph capture). Throw it away.
     if device.type == "cuda":
         torch.cuda.synchronize()
-    llm.engine.step()
+    while llm.engine.has_unfinished_requests() and not _all_in_decode(llm, batch):
+        llm.engine.step()
     if device.type == "cuda":
         torch.cuda.synchronize()
 

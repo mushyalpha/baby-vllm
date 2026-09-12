@@ -142,8 +142,11 @@ class ModelRunner:
         max_batched_tokens = (
             self.scheduler_config.max_num_batched_tokens if self.scheduler_config else 2048
         )
-        dummy_input = torch.zeros(max_batched_tokens, dtype=torch.int64, device=self.device)
-        dummy_positions = torch.arange(max_batched_tokens, dtype=torch.int64, device=self.device)
+        # Dummy forward only profiles activation memory. Full max_num_batched_tokens
+        # (e.g. 64*2048) would materialize a naive attention matrix and OOM.
+        dummy_len = min(max_batched_tokens, 2048)
+        dummy_input = torch.zeros(dummy_len, dtype=torch.int64, device=self.device)
+        dummy_positions = torch.arange(dummy_len, dtype=torch.int64, device=self.device)
 
         with torch.inference_mode():
             hidden_states = self.model(dummy_input, dummy_positions)
