@@ -432,7 +432,7 @@ class ModelRunner:
 
         buf = self._ensure_static_buffers(batch_bucket, ctx_bucket)
         if len(self._seq_lens_cpu) < batch_bucket:
-            self._seq_lens_cpu = [1] * batch_bucket
+            self._seq_lens_cpu = [0] * batch_bucket
 
         side_stream = torch.cuda.Stream()
         with torch.cuda.stream(side_stream):

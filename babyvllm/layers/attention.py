@@ -36,79 +36,19 @@ class Attention(nn.Module):
         md = ctx.attn_metadata
         store_kvcache(k, v, self.kv_cache, md.slot_mapping)
         if md.max_query_len == 1:
-            return _static_decode_attention(
-                q, self.kv_cache, md, self.scale,
-                self.num_heads, self.num_kv_heads, self.head_dim,
-                self.num_queries_per_kv,
-            )
+            #decode
+            if q.is_cuda:
+                try:
+                    from babyvllm.kernels.paged_attn import paged_decode_attention
+                    return paged_decode_attention(
+                        q, self.kv_cache, md.block_tables, md.seq_lens, self.scale,
+                    )
+                except ImportError:
+                    pass
+            return _paged_attention_torch(q, self.kv_cache, md, self.scale,
+                                          self.num_queries_per_kv)
         return _paged_attention_torch(q, self.kv_cache, md, self.scale,
                                       self.num_queries_per_kv)
-
-
-def gather_kv_batched(
-    kv_cache: torch.Tensor,
-    block_tables: torch.Tensor,
-    ctx_bucket: int,
-    block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    n_blocks_needed = (ctx_bucket + block_size - 1) // block_size
-    n_blocks_needed = min(n_blocks_needed, block_tables.shape[1])
-    B = block_tables.shape[0]
-    n_kv_heads = kv_cache.shape[3]
-    head_dim = kv_cache.shape[4]
-
-    bt = block_tables[:, :n_blocks_needed]
-    bt_flat = bt.reshape(-1)
-
-    k_blocks = kv_cache[0][bt_flat]
-    v_blocks = kv_cache[1][bt_flat]
-
-    gathered = n_blocks_needed * block_size
-    k = k_blocks.reshape(B, gathered, n_kv_heads, head_dim)
-    v = v_blocks.reshape(B, gathered, n_kv_heads, head_dim)
-
-    k = k[:, :ctx_bucket].permute(0, 2, 1, 3)
-    v = v[:, :ctx_bucket].permute(0, 2, 1, 3)
-    return k, v
-
-
-def make_decode_mask(
-    seq_lens: torch.Tensor,
-    ctx_bucket: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> torch.Tensor:
-    positions = torch.arange(ctx_bucket, device=device)
-    seq_lens_long = seq_lens.to(torch.int64)
-    valid = positions[None, :] < seq_lens_long[:, None]
-    additive = torch.zeros(
-        seq_lens.shape[0], 1, 1, ctx_bucket, dtype=dtype, device=device
-    )
-    return additive.masked_fill(~valid[:, None, None, :], float("-inf"))
-
-
-def _static_decode_attention(
-    q, kv_cache, md, scale, num_heads, num_kv_heads, head_dim, num_queries_per_kv,
-):
-    B = md.seq_lens.shape[0]
-    ctx_bucket = md.max_seq_len
-    block_size = kv_cache.shape[2]
-
-    K, V = gather_kv_batched(kv_cache, md.block_tables, ctx_bucket, block_size)
-    Q = q.reshape(B, num_heads, 1, head_dim)
-    mask = make_decode_mask(md.seq_lens, K.shape[2], q.device, q.dtype)
-
-    group = num_queries_per_kv
-    if group > 1:
-        Q = Q.reshape(B, num_kv_heads, group, head_dim)
-    out = F.scaled_dot_product_attention(
-        Q, K, V,
-        attn_mask=mask,
-        scale=scale,
-    )
-    if group > 1:
-        out = out.reshape(B, num_heads, 1, head_dim)
-    return out.squeeze(2).reshape(-1, num_heads, head_dim)
 
 
 def _paged_attention_torch(query, kv_cache, md, scale, num_queries_per_kv):
@@ -121,6 +61,9 @@ def _paged_attention_torch(query, kv_cache, md, scale, num_queries_per_kv):
         seq_len = md.seq_lens_cpu[i]
         ctx_len = md.context_lens_cpu[i]
         q_len = end - start
+        if seq_len == 0 or q_len == 0:
+            out[start:end] = 0
+            continue
 
         num_blocks = (seq_len + block_size - 1) // block_size
         blocks = md.block_tables[i, :num_blocks]

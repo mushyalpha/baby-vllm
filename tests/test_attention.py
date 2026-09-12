@@ -249,10 +249,123 @@ def test_non_contiguous():
         
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
 
+
+def _paged_decode_case(seq_lens, num_heads, num_kv_heads, head_dim, block_size, device, seed=0):
+    torch.manual_seed(seed)
+    B = len(seq_lens)
+    pages = [max((s + block_size - 1) // block_size, 1) for s in seq_lens]
+    max_pages = max(pages)
+    n_phys = sum(pages)
+    pool = torch.randperm(n_phys + 8).tolist()
+    used = 0
+    tables = torch.zeros(B, max_pages, dtype=torch.int32)
+    max_id = max(pool[:n_phys])
+    kv = torch.randn(2, max_id + 1, block_size, num_kv_heads, head_dim)
+    q = torch.randn(B, num_heads, head_dim)
+    for i, s in enumerate(seq_lens):
+        n = pages[i]
+        ids = pool[used:used + n]
+        used += n
+        tables[i, :n] = torch.tensor(ids, dtype=torch.int32)
+        if n < max_pages:
+            tables[i, n:] = ids[-1]
+        for t in range(s):
+            b, off = divmod(t, block_size)
+            phys = ids[b]
+            kv[0, phys, off] = torch.randn(num_kv_heads, head_dim)
+            kv[1, phys, off] = torch.randn(num_kv_heads, head_dim)
+    scale = head_dim ** -0.5
+    seq = torch.tensor(seq_lens, dtype=torch.int32)
+    qsl = list(range(B + 1))
+    md = AttentionMetadata(
+        slot_mapping=torch.zeros(B, dtype=torch.int64),
+        block_tables=tables,
+        query_start_loc=torch.tensor(qsl, dtype=torch.int32),
+        seq_lens=seq,
+        context_lens=torch.tensor([max(0, s - 1) for s in seq_lens], dtype=torch.int32),
+        query_start_loc_cpu=qsl,
+        seq_lens_cpu=list(seq_lens),
+        context_lens_cpu=[max(0, s - 1) for s in seq_lens],
+        max_query_len=1,
+        max_seq_len=max(max(seq_lens), 1),
+    )
+    q = q.to(device)
+    kv = kv.to(device)
+    md.slot_mapping = md.slot_mapping.to(device)
+    md.block_tables = md.block_tables.to(device)
+    md.query_start_loc = md.query_start_loc.to(device)
+    md.seq_lens = md.seq_lens.to(device)
+    md.context_lens = md.context_lens.to(device)
+    return q, kv, md, scale
+
+
+def _triton_or_skip():
+    import pytest
+    if not torch.cuda.is_available():
+        pytest.skip("triton decode needs cuda")
+    try:
+        from babyvllm.kernels.paged_attn import paged_decode_attention
+    except ImportError:
+        pytest.skip("triton not installed")
+    return paged_decode_attention
+
+
+def test_triton_paged_decode_parity():
+    from babyvllm.layers.attention import _paged_attention_torch
+    paged_decode_attention = _triton_or_skip()
+    device = torch.device("cuda")
+    cases = [
+        [1],
+        [5],
+        [16],
+        [17],
+        [1, 5, 17],
+        [8, 0, 3],
+    ]
+    configs = [
+        (4, 2, 16, 4),
+        (14, 2, 64, 16),
+    ]
+    for seq_lens in cases:
+        for num_heads, num_kv_heads, head_dim, block_size in configs:
+            q, kv, md, scale = _paged_decode_case(
+                seq_lens, num_heads, num_kv_heads, head_dim, block_size, device,
+            )
+            q_per_kv = num_heads // num_kv_heads
+            ref = _paged_attention_torch(q, kv, md, scale, q_per_kv)
+            got = paged_decode_attention(q, kv, md.block_tables, md.seq_lens, scale)
+            torch.testing.assert_close(got, ref, atol=2e-3, rtol=2e-3)
+
+
+def test_triton_seq_len_is_data_dynamic():
+    from babyvllm.layers.attention import _paged_attention_torch
+    paged_decode_attention = _triton_or_skip()
+    device = torch.device("cuda")
+    q, kv, md, scale = _paged_decode_case(
+        [16], 14, 2, 64, 16, device,
+    )
+    q_per_kv = 7
+    short = md.seq_lens.clone()
+    short.fill_(4)
+    md_short_cpu = list(md.seq_lens_cpu)
+    md.seq_lens_cpu = [4]
+    md.context_lens_cpu = [3]
+    ref_short = _paged_attention_torch(q, kv, md, scale, q_per_kv)
+    md.seq_lens_cpu = md_short_cpu
+    md.context_lens_cpu = [15]
+    got_short = paged_decode_attention(q, kv, md.block_tables, short, scale)
+    got_full = paged_decode_attention(q, kv, md.block_tables, md.seq_lens, scale)
+    torch.testing.assert_close(got_short, ref_short, atol=2e-3, rtol=2e-3)
+    assert not torch.allclose(got_short, got_full, atol=1e-3)
+
+
 if __name__ == "__main__":
     test_prefill_parity()
     test_prefill_then_decode_parity()
     test_batched_decode()
     test_batched_mixed()
     test_non_contiguous()
+    if torch.cuda.is_available():
+        test_triton_paged_decode_parity()
+        test_triton_seq_len_is_data_dynamic()
     print("All attention tests passed!")
