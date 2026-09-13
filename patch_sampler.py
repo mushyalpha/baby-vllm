@@ -1,4 +1,7 @@
-import torch
+with open("babyvllm/layers/sampler.py", "r") as f:
+    content = f.read()
+
+new_content = """import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -60,3 +63,7 @@ class Sampler(nn.Module):
             sampled_tokens[seq.seq_id] = tokens_cpu[i]
             
         return sampled_tokens
+"""
+
+with open("babyvllm/layers/sampler.py", "w") as f:
+    f.write(new_content)

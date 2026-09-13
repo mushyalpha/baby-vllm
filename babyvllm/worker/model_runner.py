@@ -56,14 +56,8 @@ def compute_pool_reserve(
     n_layers: int,
     bytes_per_element: int = 2,
 ) -> int:
-    gather_per_layer = (
-        max_batch_bucket * n_kv_heads * max_ctx_bucket * head_dim
-        * 2
-        * bytes_per_element
-    )
-    total_gather = gather_per_layer * n_layers
-    slack = 2 * 1024 * 1024 * 1024
-    return total_gather + slack
+    slack = 512 * 1024 * 1024  # 512 MB slack for staging buffers and miscellaneous allocations
+    return slack
 
 
 @dataclass
@@ -76,6 +70,13 @@ class StaticBuffers:
     slot_mapping: torch.Tensor
     query_start_loc: torch.Tensor
     logits: torch.Tensor
+    # Pinned CPU staging buffers
+    cpu_input_ids: torch.Tensor
+    cpu_position_ids: torch.Tensor
+    cpu_seq_lens: torch.Tensor
+    cpu_context_lens: torch.Tensor
+    cpu_slot_mapping: torch.Tensor
+    cpu_block_tables: torch.Tensor
 
 
 class ModelRunner:
@@ -340,6 +341,13 @@ class ModelRunner:
             query_start_loc=torch.arange(B + 1, dtype=torch.int32, device=dev),
             logits=torch.zeros(B, V, dtype=torch.float32, device=dev),
         )
+        # Allocate pinned memory for staging
+        buf.cpu_input_ids = torch.zeros(B, dtype=torch.int64, pin_memory=True)
+        buf.cpu_position_ids = torch.zeros(B, dtype=torch.int64, pin_memory=True)
+        buf.cpu_seq_lens = torch.zeros(B, dtype=torch.int32, pin_memory=True)
+        buf.cpu_context_lens = torch.zeros(B, dtype=torch.int32, pin_memory=True)
+        buf.cpu_slot_mapping = torch.full((B,), dummy_slot, dtype=torch.int64, pin_memory=True)
+        buf.cpu_block_tables = torch.full((B, MB), self._dummy_block, dtype=torch.int32, pin_memory=True)
         self._static[key] = buf
         return buf
 
@@ -359,37 +367,35 @@ class ModelRunner:
 
         self._seq_lens_cpu = list(seq_lens) + [0] * (batch_bucket - B_actual)
 
-        buf.input_ids[:B_actual].copy_(
-            torch.tensor(token_ids, dtype=torch.int64, device=self.device)
-        )
-        buf.position_ids[:B_actual].copy_(
-            torch.tensor(positions, dtype=torch.int64, device=self.device)
-        )
-        buf.seq_lens[:B_actual].copy_(
-            torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
-        )
-        buf.context_lens[:B_actual].copy_(
-            torch.tensor([s - 1 for s in seq_lens], dtype=torch.int32, device=self.device)
-        )
-        buf.slot_mapping[:B_actual].copy_(
-            torch.tensor(slot_mappings, dtype=torch.int64, device=self.device)
-        )
-
+        # 1. Fill CPU pinned buffers directly
+        buf.cpu_input_ids[:B_actual] = torch.tensor(token_ids, dtype=torch.int64)
+        buf.cpu_position_ids[:B_actual] = torch.tensor(positions, dtype=torch.int64)
+        buf.cpu_seq_lens[:B_actual] = torch.tensor(seq_lens, dtype=torch.int32)
+        buf.cpu_context_lens[:B_actual] = torch.tensor([s - 1 for s in seq_lens], dtype=torch.int32)
+        buf.cpu_slot_mapping[:B_actual] = torch.tensor(slot_mappings, dtype=torch.int64)
+        
         if B_actual < batch_bucket:
-            buf.input_ids[B_actual:].zero_()
-            buf.position_ids[B_actual:].zero_()
-            buf.seq_lens[B_actual:].zero_()
-            buf.context_lens[B_actual:].zero_()
-            buf.slot_mapping[B_actual:].fill_(dummy_slot)
-            buf.block_tables[B_actual:].fill_(self._dummy_block)
+            buf.cpu_input_ids[B_actual:].zero_()
+            buf.cpu_position_ids[B_actual:].zero_()
+            buf.cpu_seq_lens[B_actual:].zero_()
+            buf.cpu_context_lens[B_actual:].zero_()
+            buf.cpu_slot_mapping[B_actual:].fill_(dummy_slot)
+            buf.cpu_block_tables[B_actual:].fill_(self._dummy_block)
 
+        # Batch the block tables formatting on CPU
         for i, bt in enumerate(block_tables):
             n = len(bt)
-            buf.block_tables[i, :n].copy_(
-                torch.tensor(bt, dtype=torch.int32, device=self.device)
-            )
+            buf.cpu_block_tables[i, :n] = torch.tensor(bt, dtype=torch.int32)
             if n < self.max_blocks_per_seq:
-                buf.block_tables[i, n:].fill_(self._dummy_block)
+                buf.cpu_block_tables[i, n:].fill_(self._dummy_block)
+
+        # 2. Issue non-blocking copies to GPU
+        buf.input_ids.copy_(buf.cpu_input_ids, non_blocking=True)
+        buf.position_ids.copy_(buf.cpu_position_ids, non_blocking=True)
+        buf.seq_lens.copy_(buf.cpu_seq_lens, non_blocking=True)
+        buf.context_lens.copy_(buf.cpu_context_lens, non_blocking=True)
+        buf.slot_mapping.copy_(buf.cpu_slot_mapping, non_blocking=True)
+        buf.block_tables.copy_(buf.cpu_block_tables, non_blocking=True)
 
         return buf
 

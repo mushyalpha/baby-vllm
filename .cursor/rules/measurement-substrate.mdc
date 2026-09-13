@@ -1,0 +1,12 @@
+---
+description: Published measurements are Qwen2.5-7B bf16 H100; never hardcode 0.5B or mix ladders.
+alwaysApply: true
+---
+
+Read `PROJECT_STATE.md` before changing models, configs, benchmarks, or posts. It is authoritative and supersedes older notes (including stale dumps in `CODE.md`).
+
+- Every published number is **Qwen2.5-7B, bf16, H100 SXM**. No exceptions.
+- **Qwen2.5-0.5B** is CPU unit tests and kernel-correctness iteration only. It never appears in a published table.
+- `ModelConfig` has no architecture defaults. Load with `ModelConfig.from_hf(path)` / `load_model_config()`. Do not hardcode 0.5B (or 7B) dims in `config.py`, kernels, or benches.
+- The live repo is `baby-vllm`. `mistral7B-inference` is archived Day 4/5 history.
+- Append one row to `BENCHMARKS.md` per day. Do not put 0.5B numbers on the 7B ladder.

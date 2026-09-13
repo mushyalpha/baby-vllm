@@ -69,7 +69,7 @@ def paged_decode_attn_kernel(
         scores = tl.dot(q, tl.trans(k)) * scale
         
         token = b * BLOCK + offs_n
-        mask = (token[None, :] < seq_len) & q_mask[:, None]
+        mask = token[None, :] < seq_len
         scores = tl.where(mask, scores, float("-inf"))
 
         m_new = tl.maximum(m, tl.max(scores, axis=1))
@@ -107,7 +107,7 @@ def paged_decode_attention(q, kv_cache, block_tables, seq_lens, scale):
     # Pad Q_BLOCK to 16 for Tensor Cores (tl.dot requires >= 16)
     q_block = 16 if q_per_kv <= 16 else triton.next_power_of_2(q_per_kv)
     
-    out = torch.empty_like(q)
+    out = torch.zeros_like(q)
     k_cache = kv_cache[0]
     v_cache = kv_cache[1]
     
