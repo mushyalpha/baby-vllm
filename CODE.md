@@ -1,3 +1,350 @@
+# Baby-vLLM Project Context (Days 1 - 5)
+
+## Day 4: Roofline Profiling
+# Day 4/45 — Roofline profiling: decode is memory-bound (measured)
+
+**Goal:** Prove that decode is memory bound and prefill is compute bound using a real Roofline analysis.
+
+## The Experiment
+
+I built a PyTorch roofline profiler for **Qwen2.5-7B** on an **H100**.
+
+First, I calculated the analytical floor for decode step latency before touching the GPU: **4.55 ms/step** (~220 tok/s at batch 1). 
+Then, I measured the actual HuggingFace PyTorch implementation. I only achieved **28% of that theoretical floor** (~61 tok/s).
+
+I expected batching to close this gap, but profiling showed that while GPU occupancy climbed from 65% → 89% (as batch size grew from 1 to 64), the kernels were stuck at about 40% bandwidth efficiency. Prefill, however, hit 45–55% MFU as expected once the GPU was saturated.
+
+## Key Numbers (Qwen2.5-7B BF16, H100 SXM5 @ 3.35 TB/s)
+
+| Case | Analytical floor | Measured | % of floor |
+| --- | --- | --- | --- |
+| B=1, ctx=128 | 220 tok/s | 61 tok/s | 28% |
+| B=64, ctx=128 | 13,655 tok/s | 4,478 tok/s | 33% |
+| B=64, ctx=2048 | 9,425 tok/s | 2,878 tok/s | 31% |
+
+## Where the time went (Decode)
+
+Using `torch.profiler`, the step time breaks down as:
+- **~59% Other** (framework / CPU launch overhead / Python)
+- **~34–38% Linear** (GEMM)
+- **3–8% Attention** (grows with context)
+
+The GPU is busy 65–89% of the step, but almost 60% of the *wall time* is lost to launch overhead and Python bookkeeping.
+
+## Energy (NVML)
+
+Batching is an energy strategy.
+- B=1, ctx=128: ~3.7M Joules/Mtok
+- B=64, ctx=128: ~77K Joules/Mtok
+
+Batch 64 gives **36× more tokens/joule** than Batch 1.
+
+## Conclusion & Hand-off
+
+The 28-33% efficiency against the H100 bandwidth roofline is our **engineering loss budget**. To claw it back, we need to eliminate Python overhead (CUDA graphs), write proper memory management, and build a real Paged Attention kernel.
+
+
+---
+
+## Day 5 Narrative
+# Day 5/45 of AI Inference Engineering: CUDA Graphs
+
+Today I used CUDA graphs to double the serving speed of my custom "baby-vLLM" engine for a single user. 
+But when I scaled up to 64 users, I accidentally uncovered a hidden PyTorch bug copying 105 GB of memory for no reason. 🧵👇
+
+**Some context:** 
+Earlier this week, I built a custom "baby-vLLM" engine with the goal of getting a first-principled understanding of why vLLM is powerful. 
+I intentionally started bare-bones so I could add the optimizations myself, layer by layer. 
+
+**The Day 4 Problem:**
+Yesterday, I hit my first major bottleneck. Even with my custom engine, the GPU was spending 60% of its time doing absolutely nothing. 
+Why? Because Python was sending 1,951 tiny, separate instructions to the GPU for every single word generated. 
+The GPU is so incredibly fast that it would finish the math in a microsecond, and then sit around waiting for Python to send the next instruction. 
+Out of a 21.2 ms step, the H100 spent 12.7 ms just staring at the wall. You don't rent a $30,000 GPU to wait on Python.
+
+**The Day 5 Solution:**
+Today I applied CUDA graphs to my custom-built engine to solve this. Instead of sending 1,951 separate instructions, I locked all the memory into static buffers and captured the whole decode step into a single CUDA graph.
+It worked miraculously. 
+This slashed the total time down to 9.5 ms. The idle waiting time dropped from 12.7 ms to just 1.2 ms, and the serving speed more than doubled from 47 tokens/sec to 105 tokens/sec.
+
+The absolute physical memory bandwidth limit of the H100 for a 7B model is 4.5 ms. By dropping my step time to 9.5 ms, I am now operating at nearly 50% of the theoretical hardware limit.
+
+**But surprisingly...**
+When I simulated a heavy production load (Batch 64, or 64 concurrent users), my shiny new engine completely choked. 
+It took 187 ms per step. That is 8x slower than the basic, unoptimized HuggingFace code I started with on Day 4. What happened?
+
+I profiled it and found a catastrophe. 
+A specific PyTorch attention setting (`enable_gqa=True`) was secretly triggering a fallback that needlessly duplicated memory. PyTorch was blindly copying 105 Gigabytes of data back and forth inside the GPU on every single step.
+
+I applied a 2-line fix. By manually "folding" the tensor shape, I completely bypassed PyTorch's memory expansion. 
+The latency instantly plummeted from a disastrous 187 ms down to an incredible 20.9 ms. I fixed an 8x slowdown with a reshape.
+
+**So for Day 6:**
+CUDA graphs are done. We've squeezed everything we can out of standard PyTorch. 
+Tomorrow, I leave Python behind. I'll be writing a custom Triton kernel to handle Paged Attention natively on the GPU hardware.
+
+
+---
+
+## Day 5 Results Summary
+# Day 5/45 — CUDA Graphs: final results
+
+**Date:** 10 September 2026  
+**Question of the series:** why is running this model so expensive, and what in the code is wasting the GPU.
+
+The GPU was not slow. Python was making it wait. CUDA graphs fixed the waiting. Then PyTorch was secretly copying ~105 GB per token at batch 64; a reshape stopped that. What is left is inside the kernels.
+
+---
+
+## Setup
+
+| | |
+|---|---|
+| GPU | NVIDIA H100 80GB HBM3 (rated 3.35 TB/s) |
+| Torch | 2.8.0+cu128 |
+| Models | Qwen2.5-7B (7.616e9 params, 28 layers, 4 KV heads, head_dim 128) and Qwen2.5-0.5B |
+| Engine | baby-vLLM (Day 3) + static buffers + CUDA-graph capture (Day 5) |
+| Timing | CUDA events, warmup 10 / timed 50, **median** ms |
+| Floor | `(weights + B·ctx·KV) / 3.35e12` using **actual ctx**, not the bucket |
+| Weight traffic | 15.23 GB/step (7B BF16) |
+| KV bytes/token (7B) | 57,344 |
+| Graph pool | 0.661 GB, 14 graphs keyed by `(batch_bucket, ctx_bucket)` |
+| Buckets | batch `{1,2,4,8,16,32,64}`, ctx `{256, 2048}` |
+| Long-ctx cell | measured **ctx=1920** (bucket 2048). True 2048 does not fit warmup+timed in that bucket. |
+| HuggingFace column | Day 4, same GPU/model. ctx=1920 uses HF ctx=2048. Not re-measured on Day 5. |
+
+Raw JSON: `results_7B (1).json`, `results_0.5B (1).json`, `profile_day5.json`, `results_gqa_fold_b64.json`.
+
+---
+
+## The story in four beats
+
+**1. One user, one token — the GPU is bored.**  
+A normal Python decode step sent the GPU **1,951 instructions** for every token. Each kernel was microseconds. Then the GPU waited for the next note. On a **21.2 ms** step, **12.7 ms was idle** (~60%). You were paying H100 rent for waiting.
+
+**2. CUDA graphs — give it all the instructions at once.**  
+Record the step once, replay as **2 CPU launches**. Same kernels, same math. **21.2 → 9.5 ms**, **47 → 105 tokens/sec**, **2.22×**. Kernel time barely moved (8.56 → 8.35 ms). Graphs delete **gaps**, not work.
+
+**3. Batch 64 — PyTorch copies 105 GB for no reason.**  
+64 users at once. Graphs did nothing (**187 ms** vs 191 ms static). HuggingFace on the same GPU: **22.6 ms**. We were **8× slower** than the baseline we set out to beat. Cause: `enable_gqa=True` plus an additive mask selects the math backend, which implements GQA as `repeat_interleave` on K/V. ~105 GB/step of avoidable traffic.
+
+**4. Diagnostic (same cell, q-fold, not a full matrix re-run).**  
+Fold the GQA group into the query-length dim. Do not expand K/V. Same cell: **187 → 20.9 ms**. HuggingFace is 22.6 ms. Padding 33→64 fell from **+49.5% to +4.8%**. Keep 187 in the published table; 20.9 is the one-line callout.
+
+---
+
+## Headline — 7B, batch 1, ctx=128
+
+| | static eager (launch loop) | CUDA graph |
+|---|---|---|
+| ms / decode step | 21.2 | **9.5** |
+| tokens / sec | 47 | **105** |
+| CPU launches / step | **1,951** | **2** |
+| kernels executed / step | 1,950 | 1,865 |
+| Σ kernel time (nsys) | 8.56 ms | 8.35 ms |
+| idle gaps (CUDA-event wall − kernel) | **12.7 ms** | **1.2 ms** |
+| GPU busy (kernel / CUDA-event wall) | **40%** | **88%** |
+| % of HBM floor (4.55 ms) | 21% | **48%** |
+| speedup vs static | — | **2.22×** |
+
+Idle accounting: nsys inflates wall in proportion to kernels traced. Kernel *durations* are good. Take ms from CUDA events, kernel time from nsys, idle = wall − kernel. Do not quote nsys busy 27% → 70%.
+
+Kernel time alone is 8.5 ms against a 4.55 ms floor → **54% bandwidth efficiency** inside the kernels. A perfect graph on this implementation cannot beat ~54% of floor. We measured **47.7%** — about **88% of the available graph win**. Graphs are done.
+
+---
+
+## Day 4 correction
+
+Day 4 reported “59% launch overhead” and “40% kernel bandwidth efficiency” as two findings. They were **one finding double-counted** — both used wall time as the denominator.
+
+Measured properly at B=1/ctx=128 on baby-vLLM:
+
+| Quantity | Value |
+|---|---|
+| Analytical floor | 4.55 ms |
+| Σ kernel time | 8.5 ms |
+| Kernel bandwidth efficiency | 4.55 / 8.5 = **54%** |
+| Idle gaps | 12.7 ms (60% of the step) |
+| Step (measured) | 21.2 ms |
+
+Day 4 measured HuggingFace; Day 5 measures baby-vLLM with 1,951 launches/step. Same mechanism; magnitudes are not transferable.
+
+---
+
+## nsys — B=1, ctx=128 (static eager vs graph)
+
+`--trace=cuda,nvtx --cuda-graph-trace=node`. 20 NVTX `decode_step`s.
+
+| | static eager | graph |
+|---|---|---|
+| CUDA-event wall | 21.235 ms | 9.545 ms |
+| nsys NVTX wall (inflated) | 30.34 ms | ~12.5 ms |
+| Σ kernel / step | 8.557 ms | 8.349 ms |
+| idle / step | 12.678 ms | 1.196 ms |
+| busy | 40.3% | 87.5% |
+| CPU launches / step | 1951 | 2 |
+| kernels / step | 1949 | 1864 |
+
+### GEMM is already on the HBM roof
+
+The old top-two table (2.82 + 1.26 = 4.08 ms) implied **3.73 TB/s**, above the 3.35 TB/s peak — physically impossible. Summing **all** `nvjet*` / `gemv*` variants:
+
+| | eager | graph |
+|---|---|---|
+| GEMM time | 5.39 ms (7 variants, 252 kernels) | 5.47 ms (8 variants, 242 kernels) |
+| Implied bandwidth | **2.82 TB/s = 84% of peak** | 2.79 TB/s = 83% of peak |
+| Other kernels | 3.17 ms | 2.88 ms |
+
+GEMMs are not the Day 6 target at B=1. The addressable leftover is **~1,240 unfused elementwise kernels (~2.9 ms)**.
+
+### Chart 2 encoding (absolute ms, not %)
+
+| Bar | GEMM | Other kernels | Idle | Total |
+|---|---|---|---|---|
+| static eager | 5.4 | 3.2 | **12.7** | 21.2 |
+| graph | 5.5 | 2.9 | **1.2** | 9.5 |
+
+Kernel blocks are the same height. The gray idle block collapses. That is the graph result.
+
+---
+
+## Full 7B matrix (median ms)
+
+`graph_vs_static` is the Day 5 number. HuggingFace is Day 4. Compile at low batch is contaminated (same process as hand-rolled graphs) — do not lead with it.
+
+| B | ctx | floor | HF eager | day3 | static | graph | compile | graph/static | graph % floor |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 128 | 4.549 | 14.43 | 20.44 | 21.24 | **9.55** | 44.71 | **2.22×** | **47.7%** |
+| 1 | 1920 | 4.580 | 14.33 | 21.51 | 22.82 | 12.15 | 45.85 | 1.88× | 37.7% |
+| 4 | 128 | 4.555 | 14.49 | 40.29 | 22.52 | 10.86 | 45.39 | 2.07× | 41.9% |
+| 4 | 1920 | 4.678 | 14.27 | 40.59 | 24.30 | 20.64 | 50.08 | 1.18× | 22.7% |
+| 16 | 128 | 4.582 | 14.54 | 115.92 | 23.86 | 15.93 | 48.03 | 1.50× | 28.8% |
+| 16 | 1920 | 5.072 | 14.47 | 114.96 | 58.63 | 54.66 | 66.59 | 1.07× | 9.3% |
+| 64 | 128 | 4.687 | 14.31 | 407.21 | 37.62 | 33.55 | 57.69 | 1.12× | 14.0% |
+| 64 | 1920 | 6.650 | **22.57** | 402.49 | 190.88 | **186.86** | 165.38 | 1.02× | 3.6% |
+
+At B=64/ctx=1920 the published graph number is **186.86 ms vs HF 22.57 ms = 8.3× slower than HuggingFace**. Graphs recover 2%. That cell is copy-bound, not launch-bound.
+
+Chart 3 plots **ctx=128 only** so B=1 is 2.22×, not the 2.05× average of (2.22 + 1.88)/2.
+
+---
+
+## Batch 64 diagnostic — GQA materialize
+
+`enable_gqa=True` does **not** save memory on the math backend. An explicit additive mask disqualifies flash. The fallback does `key.repeat_interleave` / `value.repeat_interleave`.
+
+Arithmetic at B=64, ctx bucket 2048:
+
+| Term | Bytes | @ peak |
+|---|---|---|
+| Weights | 15.23 GB | 4.5 ms |
+| Gather + permute + contiguous | ~22.5 GB | 6.7 ms |
+| GQA expand 4→28 heads, K+V, 28 layers (write+read) | **~105 GB** | **31 ms** |
+| Total at peak | ~143 GB | ~43 ms |
+
+Measured 187 ms ⇒ those copies run at ~23% of peak (uncoalesced strided copies). The 187 ms is explained.
+
+**Fix (in `static_attention.py`):** fold the query group dim instead of expanding KV. Mathematically identical. Use `.reshape`, not `.view`, on the SDPA output (non-contiguous).
+
+```text
+q: [B, 28, 1, 128] → [B, 4, 7, 128]
+k, v: [B, 4, ctx, 128]  — untouched
+mask: [B, 1, 1, ctx] broadcasts over the group dim
+```
+
+### Same cell, after the fold (not a full matrix re-run)
+
+File: `results_gqa_fold_b64.json`. GPU: H100 80GB HBM3.
+
+| | Published (enable_gqa) | After q-fold |
+|---|---|---|
+| static eager | 190.88 ms | **23.85 ms** |
+| CUDA graph | **186.86 ms** | **20.90 ms** |
+| graph / static | 1.02× | 1.14× |
+| % of floor | 3.6% | **31.8%** |
+| vs HF 22.57 ms | 8.3× slower | about even |
+
+**187 → 20.9 ms.** Day 3 path still ~401 ms (Python loop + its own `repeat_interleave`).
+
+nsys at B=64 was **not** captured: the diagnostic pod had no `/opt/nsight-systems`. `profile_b64_old.json` is torch.profiler fallback and is not usable. The timing drop is the proof.
+
+Keep **186.86 ms** in the published table. Report 20.9 ms as a one-line “fixed cell” callout.
+
+---
+
+## Padding waste (graph path, ctx=128 → bucket 256)
+
+Padding is nearly free when you are weight-bound, and linear when you are attention-bound.
+
+| | padded rows | overhead **before** q-fold | overhead **after** q-fold |
+|---|---|---|---|
+| 7B B=3→4 (25% padded) | 1 | +3.5% | +0.3% |
+| 7B B=33→64 (48% padded) | 31 | **+49.5%** | **+4.8%** |
+| 0.5B B=3→4 | 1 | +1.9% | — |
+| 0.5B B=33→64 | 31 | +31.0% | — |
+
+Pre-registered Day 6 prediction was: after the attention kernel lands, 33→64 padding should fall from ~49% toward ~10%. The q-fold already landed **4.8%**. The remaining Day 6 job is paged attention without a gather buffer, not padding.
+
+---
+
+## 0.5B — bound by kernel count, not bytes
+
+| B | ctx | floor | static | graph | graph/static | % floor |
+|---|---|---|---|---|---|---|
+| 1 | 128 | 0.295 | 18.68 | **3.94** | **4.74×** | 7.5% |
+| 1 | 1920 | 0.302 | 17.79 | 4.63 | 3.84× | 6.5% |
+| 4 | 128 | 0.297 | 17.73 | 4.51 | 3.93× | 6.6% |
+| 4 | 1920 | 0.323 | 19.25 | 6.94 | 2.77× | 4.7% |
+| 16 | 128 | 0.302 | 20.20 | 5.92 | 3.41× | 5.1% |
+| 16 | 1920 | 0.408 | 20.11 | 15.53 | 1.29× | 2.6% |
+| 64 | 128 | 0.325 | 21.63 | 10.56 | 2.05× | 3.1% |
+| 64 | 1920 | 0.746 | 55.19 | 51.01 | 1.08× | 1.5% |
+
+After graphs, 0.5B B=1 is **3.94 ms vs a 0.295 ms floor** (7.5% of floor). Scale launches: 1,951 × 24/28 ≈ 1,670 kernels. 3.94 ms / 1,670 ≈ **2.36 µs per kernel** — about the minimum wall-clock of a trivial kernel on an H100.
+
+The small model is not bandwidth-bound or launch-bound after graphs. It is bound by **how many kernels exist**. That is fusion (Day 7).
+
+---
+
+## What we did *not* get
+
+- nsys at B=64 (no Nsight on the diagnostic pod). Do not cite `profile_b64_old.json`.
+- HuggingFace re-measured on Day 5 (`hf_eager_ms` is null in the JSON; table uses Day 4).
+- A clean `torch.compile` column. Same-process graphs poison `reduce-overhead`. Ignore compile at low batch. At B=64/ctx=1920 compile beat graph (165 vs 187) — do not lead with that.
+- Pool reserve is still **9.66 GB reserved / 0.661 GB used**. About 9 GB of KV cache given away. Day 6: reserve `measured_pool × 2 + 0.5 GB` after a calibration run.
+
+---
+
+## Day 6 — numbers already committed
+
+1. **Triton paged decode attention.** `seq_lens` as a device tensor, blocks read through the block table, group dim folded into query length, no mask materialization, no gather buffer. Targets: B=64/ctx=2048 **187 → under 40 ms** (q-fold already at 21 ms; kernel should hold that without the gather). Padding 33→64 already **4.8%**. Drop ctx buckets if the kernel makes them unnecessary.
+2. **Correctness gate** first: exact token-ID match vs SDPA for 64 greedy steps, plus one bucket-switch replay.
+3. **Reference:** `flash_attn_with_kvcache` or vLLM’s kernel.
+4. **Free:** fix the 9 GB pool over-reserve; finer batch buckets if still padding-bound.
+
+**Day 7 (fusion):** ~1,240 elementwise kernels, ~2.1–2.9 ms. At B=1, 9.5 ms toward ~7.4 ms (48% → ~61% of floor).
+
+---
+
+## Files
+
+| File | What it is |
+|---|---|
+| `results_7B (1).json` | Published 7B matrix (includes 186.86 ms cell) |
+| `results_0.5B (1).json` | 0.5B matrix |
+| `profile_day5.json` | nsys B=1/ctx=128, idle = CUDA-event − kernel |
+| `results_gqa_fold_b64.json` | Diagnostic: same B=64/ctx=1920 cell after q-fold (**20.90 ms**) |
+| `charts/chart_1_roofline.png` | tok/s vs batch: static eager, graph, HF |
+| `charts/chart_2_other.png` | Absolute ms: GEMM / other kernels / idle |
+| `charts/chart_3_speedup.png` | Speedup vs batch, **ctx=128 only** |
+| `day5-cuda-graphs.html` | Animation: shared ms axis, idle 12.7 → 1.2, 47 → 105 tok/s |
+| `poster_day5.png` | Freeze frame of that animation |
+| `static_attention.py` | Q-fold (`.reshape`); do not use `enable_gqa=True` with an additive mask |
+
+
+---
+# Codebase
+
 sequence.py
 
 ```python
@@ -9,9 +356,6 @@ from dataclasses import dataclass, field
 class SamplingParams:
     temperature: float = 1.0
     top_p: float = 1.0
-    top_k: int = -1
-    min_tokens: int = 0
-    seed: int | None = None
     ignore_eos: bool = False
     max_tokens: int = 256
     stop_tokens: set[int] = field(default_factory=set)
@@ -222,7 +566,7 @@ class SchedulerOutput:
     preempted_seqs: list[Sequence]
 
 class Scheduler:
-    def __init__(self, kv_cache_manager: KVCacheManager, max_num_batched_tokens: int = 8, max_num_seqs: int = 4):
+    def __init__(self, kv_cache_manager: KVCacheManager, max_num_batched_tokens: int = 2048, max_num_seqs: int = 256):
         
         
         self.kv_cache_manager = kv_cache_manager
@@ -273,21 +617,18 @@ class Scheduler:
         
         self.kv_cache_manager.free_if_allocated(seq)
 
-    def update_sequence(self, seq: Sequence):
-        if seq.generated_token_len > 0:
-            token_id = seq.last_token_id
-            if token_id in seq.sampling_params.stop_tokens:
-                self._finish(seq, SequenceFinishReason.STOP)
-            elif seq.generated_token_len >= seq.sampling_params.max_tokens:
-                self._finish(seq, SequenceFinishReason.LENGTH)
-
     def update_from_output(self, scheduler_output: SchedulerOutput, model_output: dict[int, int]):
         for seq in scheduler_output.scheduled_sequences:
             num_scheduled = scheduler_output.num_scheduled_tokens[seq.seq_id]
             seq.advance_computed(num_scheduled)
             if seq.seq_id in model_output:
-                seq.append_token(model_output[seq.seq_id])
-                self.update_sequence(seq)
+                token_id = model_output[seq.seq_id]
+                if token_id in seq.sampling_params.stop_tokens:
+                    self._finish(seq, SequenceFinishReason.STOP)
+                else:
+                    seq.append_token(token_id)
+                    if seq.generated_token_len >= seq.sampling_params.max_tokens:
+                        self._finish(seq, SequenceFinishReason.LENGTH)
 
     def schedule(self) -> SchedulerOutput:
         budget = self.max_num_batched_tokens
@@ -299,6 +640,8 @@ class Scheduler:
         running_seqs = list(self.running)
         preempted_seqs = []
         for seq in running_seqs:
+            if seq.status != SequenceState.RUNNING:
+                continue
             needed = seq.num_tokens_to_compute
             
             if budget < needed or len(scheduled_sequences) >= self.max_num_seqs:
@@ -375,6 +718,7 @@ from babyvllm.sequence import (
 )
 from babyvllm.scheduler import Scheduler, SchedulerOutput
 from babyvllm.kv_cache_manager import KVCacheManager
+from babyvllm.worker.model_runner import nvtx_range
 
 
 @dataclass
@@ -382,6 +726,7 @@ class RequestOutput:
     seq_id: int
     new_token_ids: list[int]
     finish_reason: SequenceFinishReason | None = None
+    text: str = ""
 
     @property
     def finished(self) -> bool:
@@ -396,9 +741,12 @@ class LLMEngine:
         max_num_seqs: int = 4,
     ):
         self.model_runner = model_runner
+        num_blocks = getattr(model_runner, "num_blocks", None)
+        if not num_blocks:
+            num_blocks = model_runner.determine_num_blocks()
 
         self.kv_cache_manager = KVCacheManager(
-            num_blocks=model_runner.determine_num_blocks(),
+            num_blocks=num_blocks,
             block_size=model_runner.block_size,
         )
 
@@ -429,7 +777,9 @@ class LLMEngine:
         return seq.seq_id
 
     def abort_request(self, seq_id: int) -> None:
-        seq = self.sequences[seq_id]
+        seq = self.sequences.get(seq_id)
+        if seq is None:
+            return
 
         if not seq.is_finished:
             self.scheduler.abort_seq(seq)
@@ -442,8 +792,10 @@ class LLMEngine:
             return []
 
         scheduler_output = None
+        sampled_tokens = {}
         if self.has_unfinished_requests():
-            scheduler_output = self.scheduler.schedule()
+            with nvtx_range("schedule"):
+                scheduler_output = self.scheduler.schedule()
 
             made_progress = (
                 bool(scheduler_output.scheduled_sequences) or 
@@ -467,23 +819,24 @@ class LLMEngine:
                         "ModelRunner returned incorrect type"
                     )
 
-                self.scheduler.update_from_output(
-                    scheduler_output,
-                    sampled_tokens,
-                )
+                with nvtx_range("update"):
+                    self.scheduler.update_from_output(
+                        scheduler_output,
+                        sampled_tokens,
+                    )
 
         outputs = []
         handled_seq_ids = set()
-
-        sampled_tokens = sampled_tokens if 'sampled_tokens' in locals() else {}
         
         if scheduler_output and scheduler_output.scheduled_sequences:
             for seq in scheduler_output.scheduled_sequences:
                 if seq.seq_id in sampled_tokens:
+                    token = sampled_tokens[seq.seq_id]
+                    new_ids = [] if token in seq.sampling_params.stop_tokens else [token]
                     outputs.append(
                         RequestOutput(
                             seq_id=seq.seq_id,
-                            new_token_ids=[sampled_tokens[seq.seq_id]],
+                            new_token_ids=new_ids,
                             finish_reason=seq.finish_reason,
                         )
                     )
@@ -502,7 +855,7 @@ class LLMEngine:
 
         return outputs
 
-    def run(self, max_steps: int = 1000) -> dict[int, RequestOutput]:
+    def run(self, max_steps: int = 100_000) -> dict[int, RequestOutput]:
         steps = 0
         final_outputs: dict[int, RequestOutput] = {}
         
@@ -536,13 +889,14 @@ class LLMEngine:
 llm.py
 
 ```python
+import os
 import torch
 from transformers import AutoTokenizer
 from huggingface_hub import snapshot_download
 
 from babyvllm.config import ModelConfig, CacheConfig, SchedulerConfig
 from babyvllm.engine import LLMEngine
-from babyvllm.worker.model_runner import ModelRunner
+from babyvllm.worker.model_runner import ModelRunner, pick_device
 from babyvllm.worker.loader import load_model
 from babyvllm.sequence import SamplingParams
 
@@ -551,50 +905,109 @@ class LLM:
         self,
         model_name: str,
         cache_config: CacheConfig = None,
-        scheduler_config: SchedulerConfig = None
+        scheduler_config: SchedulerConfig = None,
+        device=None,
+        verbose: bool = False,
+        use_cuda_graphs: bool | None = None,
     ):
         self.model_name = model_name
+        self.verbose = verbose
+        device = torch.device(device) if device is not None else pick_device()
+        self._log(f"Loading {model_name} on {device}...")
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         
-        self.model_config = ModelConfig()
+        try:
+            from transformers import GenerationConfig
+            gen_cfg = GenerationConfig.from_pretrained(model_name)
+            if isinstance(gen_cfg.eos_token_id, list):
+                self.eos_token_id = set(gen_cfg.eos_token_id)
+            elif isinstance(gen_cfg.eos_token_id, int):
+                self.eos_token_id = {gen_cfg.eos_token_id}
+            else:
+                self.eos_token_id = set()
+        except Exception:
+            if self.tokenizer.eos_token_id is not None:
+                self.eos_token_id = {self.tokenizer.eos_token_id}
+            else:
+                self.eos_token_id = set()
         
-        path = snapshot_download(repo_id=model_name)
+        if os.path.isdir(model_name):
+            path = model_name
+        else:
+            self._log("Downloading / resolving checkpoint...")
+            path = snapshot_download(repo_id=model_name)
+            self._log(f"Checkpoint ready at {path}")
         
-        self.model_runner = ModelRunner(self.model_config)
-        load_model(self.model_runner.model, path)
+        import json
+        with open(f"{path}/config.json", "r") as f:
+            hf_cfg = json.load(f)
+            
+        self.model_config = ModelConfig(
+            vocab_size=hf_cfg.get("vocab_size", 151936),
+            hidden_size=hf_cfg.get("hidden_size", 896),
+            intermediate_size=hf_cfg.get("intermediate_size", 4864),
+            num_hidden_layers=hf_cfg.get("num_hidden_layers", 24),
+            num_attention_heads=hf_cfg.get("num_attention_heads", 14),
+            num_key_value_heads=hf_cfg.get("num_key_value_heads", 2),
+            rms_norm_eps=hf_cfg.get("rms_norm_eps", 1e-6),
+            max_position_embeddings=hf_cfg.get("max_position_embeddings", 32768),
+            rope_theta=hf_cfg.get("rope_theta", 1000000.0),
+            tie_word_embeddings=hf_cfg.get("tie_word_embeddings", True),
+        )
         
         sched_cfg = scheduler_config or SchedulerConfig()
         
+        self._log("Building model...")
+        self.model_runner = ModelRunner(
+            self.model_config,
+            cache_config=cache_config,
+            scheduler_config=sched_cfg,
+            device=device,
+            use_cuda_graphs=use_cuda_graphs,
+        )
+        self._log("Loading weights...")
+        load_model(self.model_runner.model, path)
+
+        num_blocks = self.model_runner.allocate_kv_cache()
+        profile = self.model_runner.kv_profile or {}
+        if "peak_memory_gb" in profile:
+            self._log(
+                f"KV profile: peak {profile['peak_memory_gb']:.2f} GB / "
+                f"{profile['total_memory_gb']:.2f} GB, "
+                f"{profile['available_for_kv_gb']:.2f} GB free for cache → "
+                f"{num_blocks} blocks "
+                f"({profile['max_kv_tokens']} tokens)"
+            )
+        else:
+            self._log(f"KV cache: {num_blocks} blocks (CPU/MPS fallback)")
+
         self.engine = LLMEngine(
             model_runner=self.model_runner,
             max_num_batched_tokens=sched_cfg.max_num_batched_tokens,
             max_num_seqs=sched_cfg.max_num_seqs
         )
+        if self.model_runner.use_cuda_graphs:
+            self._log("CUDA graphs enabled for decode")
+        self._log("Engine ready.")
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(msg, flush=True)
 
     def generate(self, prompts: list[str], sampling_params=None):
+        import copy
         if sampling_params is None:
             sampling_params = SamplingParams(temperature=0.0)
 
         for prompt in prompts:
-            token_ids = self.tokenizer(prompt).input_ids
-            self.engine.add_request(token_ids, sampling_params)
+            req_params = copy.copy(sampling_params)
+            if not req_params.ignore_eos:
+                req_params.stop_tokens = set(req_params.stop_tokens) | self.eos_token_id
             
-        final_outputs = {}
-        while self.engine.has_unfinished_requests():
-            step_outputs = self.engine.step()
-            for out in step_outputs:
-                if out.seq_id not in final_outputs:
-                    from babyvllm.engine import RequestOutput
-                    final_outputs[out.seq_id] = RequestOutput(
-                        seq_id=out.seq_id,
-                        new_token_ids=[],
-                        finish_reason=None
-                    )
-                final_outputs[out.seq_id].new_token_ids.extend(out.new_token_ids)
-                if out.finished:
-                    final_outputs[out.seq_id].finish_reason = out.finish_reason
-        
-        outputs = list(final_outputs.values())
+            token_ids = self.tokenizer(prompt).input_ids
+            self.engine.add_request(token_ids, req_params)
+            
+        outputs = list(self.engine.run().values())
         for out in outputs:
             out.text = self.tokenizer.decode(out.new_token_ids)
             
@@ -604,6 +1017,7 @@ class LLM:
 attention.py
 
 ```python
+from babyvllm.kernels.paged_attn import paged_decode_attention
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -641,8 +1055,76 @@ class Attention(nn.Module):
                                            self.num_queries_per_kv)
         md = ctx.attn_metadata
         store_kvcache(k, v, self.kv_cache, md.slot_mapping)
+        if md.max_query_len == 1:
+            return paged_decode_attention(q, self.kv_cache, md.block_tables, md.seq_lens, self.scale)
         return _paged_attention_torch(q, self.kv_cache, md, self.scale,
                                       self.num_queries_per_kv)
+
+
+def gather_kv_batched(
+    kv_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    ctx_bucket: int,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    n_blocks_needed = (ctx_bucket + block_size - 1) // block_size
+    n_blocks_needed = min(n_blocks_needed, block_tables.shape[1])
+    B = block_tables.shape[0]
+    n_kv_heads = kv_cache.shape[3]
+    head_dim = kv_cache.shape[4]
+
+    bt = block_tables[:, :n_blocks_needed]
+    bt_flat = bt.reshape(-1)
+
+    k_blocks = kv_cache[0][bt_flat]
+    v_blocks = kv_cache[1][bt_flat]
+
+    gathered = n_blocks_needed * block_size
+    k = k_blocks.reshape(B, gathered, n_kv_heads, head_dim)
+    v = v_blocks.reshape(B, gathered, n_kv_heads, head_dim)
+
+    k = k[:, :ctx_bucket].permute(0, 2, 1, 3)
+    v = v[:, :ctx_bucket].permute(0, 2, 1, 3)
+    return k, v
+
+
+def make_decode_mask(
+    seq_lens: torch.Tensor,
+    ctx_bucket: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    positions = torch.arange(ctx_bucket, device=device)
+    seq_lens_long = seq_lens.to(torch.int64)
+    valid = positions[None, :] < seq_lens_long[:, None]
+    additive = torch.zeros(
+        seq_lens.shape[0], 1, 1, ctx_bucket, dtype=dtype, device=device
+    )
+    return additive.masked_fill(~valid[:, None, None, :], float("-inf"))
+
+
+def _static_decode_attention(
+    q, kv_cache, md, scale, num_heads, num_kv_heads, head_dim, num_queries_per_kv,
+):
+    B = md.seq_lens.shape[0]
+    ctx_bucket = md.max_seq_len
+    block_size = kv_cache.shape[2]
+
+    K, V = gather_kv_batched(kv_cache, md.block_tables, ctx_bucket, block_size)
+    Q = q.reshape(B, num_heads, 1, head_dim)
+    mask = make_decode_mask(md.seq_lens, K.shape[2], q.device, q.dtype)
+
+    group = num_queries_per_kv
+    if group > 1:
+        Q = Q.reshape(B, num_kv_heads, group, head_dim)
+    out = F.scaled_dot_product_attention(
+        Q, K, V,
+        attn_mask=mask,
+        scale=scale,
+    )
+    if group > 1:
+        out = out.reshape(B, num_heads, 1, head_dim)
+    return out.squeeze(2).reshape(-1, num_heads, head_dim)
 
 
 def _paged_attention_torch(query, kv_cache, md, scale, num_queries_per_kv):
@@ -741,9 +1223,9 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", emb.cos()[None, None, :, :], persistent=False)
         self.register_buffer("sin_cached", emb.sin()[None, None, :, :], persistent=False)
 
-    def forward(self, positions: torch.Tensor):
-        cos = self.cos_cached[0, 0, positions]
-        sin = self.sin_cached[0, 0, positions]
+    def forward(self, positions: torch.Tensor, dtype: torch.dtype):
+        cos = self.cos_cached[0, 0, positions].to(dtype)
+        sin = self.sin_cached[0, 0, positions].to(dtype)
         return cos, sin
 ```
 
@@ -770,7 +1252,7 @@ class Sampler(nn.Module):
         sampled_tokens = {}
         for i, seq in enumerate(scheduler_output.scheduled_sequences):
             params = seq.sampling_params
-            logit = logits[i]
+            logit = logits[i].float()
             
             if params is None or params.temperature == 0.0:
                 token = torch.argmax(logit).item()
@@ -872,7 +1354,7 @@ class Qwen2Model(nn.Module):
 
     def forward(self, input_ids, positions):
         x = self.embed_tokens(input_ids)
-        cos, sin = self.rotary_emb(positions)
+        cos, sin = self.rotary_emb(positions, x.dtype)
         for layer in self.layers:
             x = layer(x, cos, sin)
         x = self.norm(x)
@@ -1485,7 +1967,6 @@ class ModelRunner:
             #decode
             return self._execute_decode_graph(scheduler_output)
         return self._execute_eager(scheduler_output)
-
 ```
 
 test_attention.py
@@ -1749,7 +2230,6 @@ if __name__ == "__main__":
     test_batched_mixed()
     test_non_contiguous()
     print("All attention tests passed!")
-
 ```
 
 test_generation.py
@@ -1767,16 +2247,19 @@ def test_e2e_generation():
         "A recipe for chocolate cake:"
     ]
     
-    hf_model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float32).eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    
+    hf_model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=dtype).to(device).eval()
     tokenizer = AutoTokenizer.from_pretrained(MODEL)
     
     hf_outputs = []
     for prompt in prompts:
-        ids = tokenizer(prompt, return_tensors="pt").input_ids
+        ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
         with torch.inference_mode():
             out_ids = hf_model.generate(ids, max_new_tokens=10, do_sample=False)
         out_ids = out_ids[0][ids.shape[1]:]
-        hf_outputs.append(tokenizer.decode(out_ids))
+        hf_outputs.append(out_ids.tolist())
         
     my_llm = LLM(MODEL)
     params = SamplingParams(temperature=0.0, max_tokens=10)
@@ -1787,8 +2270,8 @@ def test_e2e_generation():
     for i in range(len(prompts)):
         print(f"--- Prompt: {prompts[i]} ---")
         print(f"HF Output: {hf_outputs[i]}")
-        print(f"My Output: {my_outputs_sorted[i].text}")
-        assert hf_outputs[i] == my_outputs_sorted[i].text
+        print(f"My Output: {my_outputs_sorted[i].new_token_ids}")
+        assert hf_outputs[i] == my_outputs_sorted[i].new_token_ids
         
     print("End-to-end greedy generation test passed!")
 
@@ -1838,6 +2321,11 @@ test_sampler.py
 ```python
 import torch
 import torch.nn.functional as F
+from unittest.mock import patch
+from dataclasses import dataclass
+
+from babyvllm.layers.sampler import Sampler
+from babyvllm.sequence import Sequence, SamplingParams
 
 def brute_force_top_p(probs: torch.Tensor, top_p: float) -> torch.Tensor:
     sorted_probs, sorted_indices = torch.sort(probs, descending=True)
@@ -1856,42 +2344,54 @@ def brute_force_top_p(probs: torch.Tensor, top_p: float) -> torch.Tensor:
         
     return out_probs / out_probs.sum()
 
-def get_vllm_top_p_probs(probs: torch.Tensor, top_p: float) -> torch.Tensor:
-    probs = probs.clone()
-    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-    cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-    
-    sorted_indices_to_remove = cumulative_probs > top_p
-    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
-    sorted_indices_to_remove[..., 0] = 0
-    
-    indices_to_remove = sorted_indices[sorted_indices_to_remove]
-    probs[indices_to_remove] = 0.0
-    probs = probs / probs.sum()
-    return probs
+@dataclass
+class MockSchedulerOutput:
+    scheduled_sequences: list
 
 def test_top_p_sampling():
     torch.manual_seed(42)
+    sampler = Sampler(vocab_size=1000)
+    
     for _ in range(100):
-        logits = torch.randn(1000)
+        logits = torch.randn(1, 1000)
         probs = F.softmax(logits, dim=-1)
         
         top_p = torch.rand(1).item() * 0.9 + 0.1
+        expected = brute_force_top_p(probs[0], top_p)
         
-        expected = brute_force_top_p(probs, top_p)
-        actual = get_vllm_top_p_probs(probs, top_p)
+        seq = Sequence([1], sampling_params=SamplingParams(top_p=top_p, temperature=1.0))
+        scheduler_out = MockSchedulerOutput([seq])
         
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
-        
+        with patch("torch.multinomial") as mock_multinomial:
+            mock_multinomial.return_value = torch.tensor([[0]])
+            sampler(logits, None, scheduler_out)
+            actual_probs = mock_multinomial.call_args[0][0]
+            
+        torch.testing.assert_close(actual_probs, expected, rtol=1e-5, atol=1e-5)
+
 def test_top_p_edge_cases():
-    probs = torch.tensor([0.4, 0.3, 0.2, 0.1])
+    sampler = Sampler(vocab_size=4)
+    probs = torch.tensor([[0.4, 0.3, 0.2, 0.1]])
+    logits = torch.log(probs)
     
-    expected = brute_force_top_p(probs, 0.1)
-    actual = get_vllm_top_p_probs(probs, 0.1)
+    # top_p = 0.1
+    expected = brute_force_top_p(probs[0], 0.1)
+    seq = Sequence([1], sampling_params=SamplingParams(top_p=0.1, temperature=1.0))
+    scheduler_out = MockSchedulerOutput([seq])
+    with patch("torch.multinomial") as mock_multinomial:
+        mock_multinomial.return_value = torch.tensor([[0]])
+        sampler(logits, None, scheduler_out)
+        actual = mock_multinomial.call_args[0][0]
     torch.testing.assert_close(actual, expected)
     
-    expected = brute_force_top_p(probs, 1.0)
-    actual = get_vllm_top_p_probs(probs, 1.0)
+    # top_p = 1.0
+    expected = brute_force_top_p(probs[0], 1.0)
+    seq = Sequence([1], sampling_params=SamplingParams(top_p=1.0, temperature=1.0))
+    scheduler_out = MockSchedulerOutput([seq])
+    with patch("torch.multinomial") as mock_multinomial:
+        mock_multinomial.return_value = torch.tensor([[0]])
+        sampler(logits, None, scheduler_out)
+        actual = mock_multinomial.call_args[0][0]
     torch.testing.assert_close(actual, expected)
 ```
 
@@ -1923,7 +2423,6 @@ class CUDAGraphRunner:
         if self._graph is None:
             raise RuntimeError("Call capture() before replay()")
         self._graph.replay()
-
 ```
 
 test_cuda_graphs.py
@@ -1941,5 +2440,262 @@ def test_ceil_to_bucket():
     assert ceil_to_bucket(256, CTX_BUCKETS) == 256
     assert ceil_to_bucket(257, CTX_BUCKETS) == 2048
     assert ceil_to_bucket(2049, CTX_BUCKETS) is None
+```
 
+paged_attn.py
+
+```python
+import torch
+import triton
+import triton.language as tl
+
+@triton.jit
+def paged_decode_attn_kernel(
+    q_ptr, k_cache, v_cache, out_ptr,
+    block_tables, seq_lens, scale,
+    stride_qs, stride_qh, stride_qd,
+    stride_kb, stride_kt, stride_kh, stride_kd,
+    stride_vb, stride_vt, stride_vh, stride_vd,
+    stride_os, stride_oh, stride_od,
+    stride_bts, stride_btb, stride_sl,
+    Q_PER_KV: tl.constexpr, Q_BLOCK: tl.constexpr,
+    HEAD_DIM: tl.constexpr, BLOCK: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+):
+    s = tl.program_id(0)
+    kvh = tl.program_id(1)
+    
+    seq_len = tl.load(seq_lens + s * stride_sl)
+    if seq_len == 0:
+        return
+
+    offs_q = tl.arange(0, Q_BLOCK)
+    offs_d = tl.arange(0, HEAD_DIM)
+    q_mask = offs_q < Q_PER_KV
+
+    q = tl.load(
+        q_ptr
+        + s * stride_qs
+        + (kvh * Q_PER_KV + offs_q)[:, None] * stride_qh
+        + offs_d[None, :] * stride_qd,
+        mask=q_mask[:, None],
+        other=0.0,
+    )
+
+    m = tl.full([Q_BLOCK], float("-inf"), dtype=tl.float32)
+    l = tl.zeros([Q_BLOCK], dtype=tl.float32)
+    acc = tl.zeros([Q_BLOCK, HEAD_DIM], dtype=tl.float32)
+
+    n_blocks = tl.minimum(tl.cdiv(seq_len, BLOCK), MAX_BLOCKS)
+    
+    bt_ptr = block_tables + s * stride_bts
+    phys = tl.load(bt_ptr)
+    
+    offs_n = tl.arange(0, BLOCK)
+    
+    for b in range(0, n_blocks):
+        # Load next phys early to hide latency (software pipelining block table)
+        next_phys = tl.load(bt_ptr + (b + 1) * stride_btb, mask=(b + 1) < n_blocks, other=0)
+        
+        k = tl.load(
+            k_cache
+            + phys * stride_kb
+            + offs_n[:, None] * stride_kt
+            + kvh * stride_kh
+            + offs_d[None, :] * stride_kd,
+        )
+        v = tl.load(
+            v_cache
+            + phys * stride_vb
+            + offs_n[:, None] * stride_vt
+            + kvh * stride_vh
+            + offs_d[None, :] * stride_vd,
+        )
+        
+        # Use tl.dot which runs on Tensor Cores!
+        scores = tl.dot(q, tl.trans(k)) * scale
+        
+        token = b * BLOCK + offs_n
+        mask = (token[None, :] < seq_len) & q_mask[:, None]
+        scores = tl.where(mask, scores, float("-inf"))
+
+        m_new = tl.maximum(m, tl.max(scores, axis=1))
+        alpha = tl.exp(m - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        
+        # Use tl.dot for the value accumulation as well!
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        
+        l = l * alpha + tl.sum(p, axis=1)
+        m = m_new
+        
+        phys = next_phys
+
+    l_safe = tl.where(l == 0, 1.0, l)
+    out = acc / l_safe[:, None]
+    
+    tl.store(
+        out_ptr
+        + s * stride_os
+        + (kvh * Q_PER_KV + offs_q)[:, None] * stride_oh
+        + offs_d[None, :] * stride_od,
+        out.to(out_ptr.dtype.element_ty),
+        mask=q_mask[:, None],
+    )
+
+
+def paged_decode_attention(q, kv_cache, block_tables, seq_lens, scale):
+    B, n_heads, head_dim = q.shape
+    n_kv_heads = kv_cache.shape[3]
+    block_size = kv_cache.shape[2]
+    
+    q_per_kv = n_heads // n_kv_heads
+    
+    # Pad Q_BLOCK to 16 for Tensor Cores (tl.dot requires >= 16)
+    q_block = 16 if q_per_kv <= 16 else triton.next_power_of_2(q_per_kv)
+    
+    out = torch.empty_like(q)
+    k_cache = kv_cache[0]
+    v_cache = kv_cache[1]
+    
+    grid = (B, n_kv_heads)
+    
+    paged_decode_attn_kernel[grid](
+        q, k_cache, v_cache, out,
+        block_tables, seq_lens, float(scale),
+        q.stride(0), q.stride(1), q.stride(2),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
+        out.stride(0), out.stride(1), out.stride(2),
+        block_tables.stride(0), block_tables.stride(1), seq_lens.stride(0),
+        Q_PER_KV=q_per_kv,
+        Q_BLOCK=q_block,
+        HEAD_DIM=head_dim,
+        BLOCK=block_size,
+        MAX_BLOCKS=block_tables.shape[1],
+        num_warps=4,
+    )
+    return out
+```
+
+test_scheduler.py
+
+```python
+import pytest
+from babyvllm.scheduler import Scheduler
+from babyvllm.sequence import Sequence
+from babyvllm.kv_cache_manager import KVCacheManager
+
+def test_scheduler_preempt_no_double_schedule():
+    kv_cache = KVCacheManager(num_blocks=2, block_size=1)
+    scheduler = Scheduler(kv_cache_manager=kv_cache, max_num_batched_tokens=32, max_num_seqs=2)
+    
+    seq1 = Sequence([1])
+    seq2 = Sequence([2])
+    
+    scheduler.add_seq(seq1)
+    scheduler.add_seq(seq2)
+    
+    out1 = scheduler.schedule()
+    assert len(out1.scheduled_sequences) == 2
+    assert len(scheduler.running) == 2
+    
+    scheduler.update_from_output(out1, {seq1.seq_id: 3, seq2.seq_id: 4})
+    
+    out2 = scheduler.schedule()
+    
+    try:
+        scheduler.update_from_output(out2, {seq1.seq_id: 5})
+    except ValueError as e:
+        pytest.fail(f"Double scheduling bug occurred: {e}")
+        
+    assert len(out2.scheduled_sequences) == 1
+
+import random
+from babyvllm.engine import LLMEngine
+from babyvllm.sequence import SamplingParams, SequenceFinishReason
+
+class FakeModelRunner:
+    def __init__(self, block_size=16):
+        self.block_size = block_size
+        self.num_blocks = 100
+        self.eos_id = 999
+        
+    def determine_num_blocks(self):
+        return self.num_blocks
+        
+    def execute_model(self, scheduler_output):
+        sampled_tokens = {}
+        for seq in scheduler_output.scheduled_sequences:
+            token = (seq.seq_id + len(seq)) % 1000
+            if len(seq) >= 15:
+                token = self.eos_id
+            sampled_tokens[seq.seq_id] = token
+        return sampled_tokens
+
+import itertools
+
+def run_stress_test(num_blocks):
+    Sequence._counter = itertools.count()
+    runner = FakeModelRunner(block_size=4)
+    runner.num_blocks = num_blocks
+    engine = LLMEngine(model_runner=runner, max_num_batched_tokens=32, max_num_seqs=8)
+    
+    original_schedule = engine.scheduler.schedule
+    def hooked_schedule():
+        out = original_schedule()
+        seq_ids = [s.seq_id for s in out.scheduled_sequences]
+        assert len(seq_ids) == len(set(seq_ids)), "Duplicate sequence in scheduled_sequences!"
+        
+        for seq in out.scheduled_sequences:
+            needed = out.num_scheduled_tokens[seq.seq_id]
+            assert len(out.slot_mappings[seq.seq_id]) == needed, "Slot mapping length mismatch!"
+        return out
+    engine.scheduler.schedule = hooked_schedule
+    
+    random.seed(42)
+    for i in range(20):
+        prompt_len = random.randint(1, 10)
+        prompt = [random.randint(0, 100) for _ in range(prompt_len)]
+        max_tokens = random.randint(5, 20)
+        engine.add_request(prompt, SamplingParams(max_tokens=max_tokens, ignore_eos=True))
+        
+    outputs = {}
+    while engine.has_unfinished_requests():
+        step_outputs = engine.step()
+        for out in step_outputs:
+            if out.seq_id not in outputs:
+                outputs[out.seq_id] = []
+            outputs[out.seq_id].extend(out.new_token_ids)
+            
+        assert engine.kv_cache_manager.num_free_blocks + len(engine.kv_cache_manager.used_block_ids) == runner.num_blocks
+        
+        for seq in engine.scheduler.running:
+            assert seq.num_computed_tokens <= len(seq)
+            
+    return outputs
+
+def test_invariant_stress_test():
+    out_large = run_stress_test(num_blocks=1000)
+    out_small = run_stress_test(num_blocks=10)
+    
+    assert len(out_large) == 20
+    assert len(out_small) == 20
+    
+    large_vals = [out_large[k] for k in sorted(out_large.keys())]
+    small_vals = [out_small[k] for k in sorted(out_small.keys())]
+    assert large_vals == small_vals, "Outputs mismatch under preemption!"
+
+def test_eos_stop():
+    runner = FakeModelRunner(block_size=4)
+    engine = LLMEngine(model_runner=runner, max_num_batched_tokens=32, max_num_seqs=8)
+    
+    prompt = [1, 2, 3]
+    engine.add_request(prompt, SamplingParams(max_tokens=50, stop_tokens={runner.eos_id}, ignore_eos=False))
+    
+    outputs = engine.run()
+    seq_out = list(outputs.values())[0]
+    
+    assert seq_out.finish_reason == SequenceFinishReason.STOP
+    assert runner.eos_id not in seq_out.new_token_ids
 ```
