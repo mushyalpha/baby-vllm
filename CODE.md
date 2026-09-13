@@ -687,7 +687,7 @@ def paged_decode_attn_kernel(
         scores = tl.dot(q, tl.trans(k)) * scale
         
         token = b * BLOCK + offs_n
-        mask = (token[None, :] < seq_len) & q_mask[:, None]
+        mask = token[None, :] < seq_len
         scores = tl.where(mask, scores, float("-inf"))
 
         m_new = tl.maximum(m, tl.max(scores, axis=1))
@@ -725,7 +725,7 @@ def paged_decode_attention(q, kv_cache, block_tables, seq_lens, scale):
     # Pad Q_BLOCK to 16 for Tensor Cores (tl.dot requires >= 16)
     q_block = 16 if q_per_kv <= 16 else triton.next_power_of_2(q_per_kv)
     
-    out = torch.empty_like(q)
+    out = torch.zeros_like(q)
     k_cache = kv_cache[0]
     v_cache = kv_cache[1]
     
@@ -829,7 +829,6 @@ class KVCacheManager:
 
 ## babyvllm/layers/attention.py
 ```python
-from babyvllm.kernels.paged_attn import paged_decode_attention
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -867,8 +866,15 @@ class Attention(nn.Module):
                                            self.num_queries_per_kv)
         md = ctx.attn_metadata
         store_kvcache(k, v, self.kv_cache, md.slot_mapping)
-        if md.max_query_len == 1:
+        if md.max_query_len == 1 and q.is_cuda and self.kv_cache.shape[2] >= 16:
+            from babyvllm.kernels.paged_attn import paged_decode_attention
             return paged_decode_attention(q, self.kv_cache, md.block_tables, md.seq_lens, self.scale)
+        if md.max_query_len == 1:
+            return _static_decode_attention(
+                q, self.kv_cache, md, self.scale,
+                self.num_heads, self.num_kv_heads, self.head_dim,
+                self.num_queries_per_kv,
+            )
         return _paged_attention_torch(q, self.kv_cache, md, self.scale,
                                       self.num_queries_per_kv)
 
@@ -1058,26 +1064,49 @@ class Sampler(nn.Module):
         attn_metadata: AttentionMetadata,
         scheduler_output,
     ) -> dict[int, int]:
-        sampled_tokens = {}
-        for i, seq in enumerate(scheduler_output.scheduled_sequences):
-            params = seq.sampling_params
-            logit = logits[i].float()
-            
-            if params is None or params.temperature == 0.0:
-                token = torch.argmax(logit).item()
+        seqs = scheduler_output.scheduled_sequences
+        if not seqs:
+            return {}
+
+        B = logits.size(0)
+        tokens = torch.empty(B, dtype=torch.int64, device=logits.device)
+        logits = logits.float()
+        
+        greedy_indices = []
+        stoch_indices = []
+        for i, seq in enumerate(seqs):
+            p = seq.sampling_params
+            if p is None or p.temperature == 0.0:
+                greedy_indices.append(i)
             else:
-                probs = F.softmax(logit / params.temperature, dim=-1)
-                if params.top_p < 1.0:
+                stoch_indices.append(i)
+                
+        if greedy_indices:
+            idx = torch.tensor(greedy_indices, device=logits.device)
+            tokens[idx] = torch.argmax(logits[idx], dim=-1)
+            
+        if stoch_indices:
+            for i in stoch_indices:
+                p = seqs[i].sampling_params
+                logit = logits[i]
+                probs = F.softmax(logit / p.temperature, dim=-1)
+                if p.top_p < 1.0:
                     sorted_probs, sorted_indices = torch.sort(probs, descending=True)
                     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                    sorted_indices_to_remove = cumulative_probs > params.top_p
+                    sorted_indices_to_remove = cumulative_probs > p.top_p
                     sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
                     sorted_indices_to_remove[..., 0] = 0
                     indices_to_remove = sorted_indices[sorted_indices_to_remove]
                     probs[indices_to_remove] = 0.0
                     probs = probs / probs.sum()
-                token = torch.multinomial(probs, num_samples=1).item()
-            sampled_tokens[seq.seq_id] = token
+                tokens[i] = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+        # ONE SINGLE CPU SYNC
+        tokens_cpu = tokens.cpu().tolist()
+        
+        sampled_tokens = {}
+        for i, seq in enumerate(seqs):
+            sampled_tokens[seq.seq_id] = tokens_cpu[i]
             
         return sampled_tokens
 ```
@@ -1700,14 +1729,8 @@ def compute_pool_reserve(
     n_layers: int,
     bytes_per_element: int = 2,
 ) -> int:
-    gather_per_layer = (
-        max_batch_bucket * n_kv_heads * max_ctx_bucket * head_dim
-        * 2
-        * bytes_per_element
-    )
-    total_gather = gather_per_layer * n_layers
-    slack = 2 * 1024 * 1024 * 1024
-    return total_gather + slack
+    slack = 512 * 1024 * 1024  # 512 MB slack for staging buffers and miscellaneous allocations
+    return slack
 
 
 @dataclass
@@ -1720,6 +1743,13 @@ class StaticBuffers:
     slot_mapping: torch.Tensor
     query_start_loc: torch.Tensor
     logits: torch.Tensor
+    # Pinned CPU staging buffers
+    cpu_input_ids: torch.Tensor
+    cpu_position_ids: torch.Tensor
+    cpu_seq_lens: torch.Tensor
+    cpu_context_lens: torch.Tensor
+    cpu_slot_mapping: torch.Tensor
+    cpu_block_tables: torch.Tensor
 
 
 class ModelRunner:
@@ -1984,6 +2014,13 @@ class ModelRunner:
             query_start_loc=torch.arange(B + 1, dtype=torch.int32, device=dev),
             logits=torch.zeros(B, V, dtype=torch.float32, device=dev),
         )
+        # Allocate pinned memory for staging
+        buf.cpu_input_ids = torch.zeros(B, dtype=torch.int64, pin_memory=True)
+        buf.cpu_position_ids = torch.zeros(B, dtype=torch.int64, pin_memory=True)
+        buf.cpu_seq_lens = torch.zeros(B, dtype=torch.int32, pin_memory=True)
+        buf.cpu_context_lens = torch.zeros(B, dtype=torch.int32, pin_memory=True)
+        buf.cpu_slot_mapping = torch.full((B,), dummy_slot, dtype=torch.int64, pin_memory=True)
+        buf.cpu_block_tables = torch.full((B, MB), self._dummy_block, dtype=torch.int32, pin_memory=True)
         self._static[key] = buf
         return buf
 
@@ -2003,37 +2040,35 @@ class ModelRunner:
 
         self._seq_lens_cpu = list(seq_lens) + [0] * (batch_bucket - B_actual)
 
-        buf.input_ids[:B_actual].copy_(
-            torch.tensor(token_ids, dtype=torch.int64, device=self.device)
-        )
-        buf.position_ids[:B_actual].copy_(
-            torch.tensor(positions, dtype=torch.int64, device=self.device)
-        )
-        buf.seq_lens[:B_actual].copy_(
-            torch.tensor(seq_lens, dtype=torch.int32, device=self.device)
-        )
-        buf.context_lens[:B_actual].copy_(
-            torch.tensor([s - 1 for s in seq_lens], dtype=torch.int32, device=self.device)
-        )
-        buf.slot_mapping[:B_actual].copy_(
-            torch.tensor(slot_mappings, dtype=torch.int64, device=self.device)
-        )
-
+        # 1. Fill CPU pinned buffers directly
+        buf.cpu_input_ids[:B_actual] = torch.tensor(token_ids, dtype=torch.int64)
+        buf.cpu_position_ids[:B_actual] = torch.tensor(positions, dtype=torch.int64)
+        buf.cpu_seq_lens[:B_actual] = torch.tensor(seq_lens, dtype=torch.int32)
+        buf.cpu_context_lens[:B_actual] = torch.tensor([s - 1 for s in seq_lens], dtype=torch.int32)
+        buf.cpu_slot_mapping[:B_actual] = torch.tensor(slot_mappings, dtype=torch.int64)
+        
         if B_actual < batch_bucket:
-            buf.input_ids[B_actual:].zero_()
-            buf.position_ids[B_actual:].zero_()
-            buf.seq_lens[B_actual:].zero_()
-            buf.context_lens[B_actual:].zero_()
-            buf.slot_mapping[B_actual:].fill_(dummy_slot)
-            buf.block_tables[B_actual:].fill_(self._dummy_block)
+            buf.cpu_input_ids[B_actual:].zero_()
+            buf.cpu_position_ids[B_actual:].zero_()
+            buf.cpu_seq_lens[B_actual:].zero_()
+            buf.cpu_context_lens[B_actual:].zero_()
+            buf.cpu_slot_mapping[B_actual:].fill_(dummy_slot)
+            buf.cpu_block_tables[B_actual:].fill_(self._dummy_block)
 
+        # Batch the block tables formatting on CPU
         for i, bt in enumerate(block_tables):
             n = len(bt)
-            buf.block_tables[i, :n].copy_(
-                torch.tensor(bt, dtype=torch.int32, device=self.device)
-            )
+            buf.cpu_block_tables[i, :n] = torch.tensor(bt, dtype=torch.int32)
             if n < self.max_blocks_per_seq:
-                buf.block_tables[i, n:].fill_(self._dummy_block)
+                buf.cpu_block_tables[i, n:].fill_(self._dummy_block)
+
+        # 2. Issue non-blocking copies to GPU
+        buf.input_ids.copy_(buf.cpu_input_ids, non_blocking=True)
+        buf.position_ids.copy_(buf.cpu_position_ids, non_blocking=True)
+        buf.seq_lens.copy_(buf.cpu_seq_lens, non_blocking=True)
+        buf.context_lens.copy_(buf.cpu_context_lens, non_blocking=True)
+        buf.slot_mapping.copy_(buf.cpu_slot_mapping, non_blocking=True)
+        buf.block_tables.copy_(buf.cpu_block_tables, non_blocking=True)
 
         return buf
 
@@ -2504,7 +2539,7 @@ def test_parity():
     
     path = snapshot_download(repo_id=MODEL)
     
-    cfg = ModelConfig()
+    cfg = ModelConfig.from_hf(path)
     mine = Qwen2ForCausalLM(cfg)
     load_model(mine, path)
     mine.eval()
@@ -2735,7 +2770,7 @@ class FakeModelRunner:
         self.num_blocks = 100
         self.eos_id = 999
         
-    def determine_num_blocks(self):
+    def allocate_kv_cache(self):
         return self.num_blocks
         
     def execute_model(self, scheduler_output):
