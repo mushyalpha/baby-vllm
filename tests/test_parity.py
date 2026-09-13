@@ -12,7 +12,7 @@ def test_parity():
     
     path = snapshot_download(repo_id=MODEL)
     
-    cfg = ModelConfig()
+    cfg = ModelConfig.from_hf(path)
     mine = Qwen2ForCausalLM(cfg)
     load_model(mine, path)
     mine.eval()

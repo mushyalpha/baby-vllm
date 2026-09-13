@@ -38,7 +38,7 @@ class FakeModelRunner:
         self.num_blocks = 100
         self.eos_id = 999
         
-    def determine_num_blocks(self):
+    def allocate_kv_cache(self):
         return self.num_blocks
         
     def execute_model(self, scheduler_output):
