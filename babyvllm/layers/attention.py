@@ -1,3 +1,4 @@
+from babyvllm.kernels.paged_attn import paged_decode_attention
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -36,11 +37,7 @@ class Attention(nn.Module):
         md = ctx.attn_metadata
         store_kvcache(k, v, self.kv_cache, md.slot_mapping)
         if md.max_query_len == 1:
-            return _static_decode_attention(
-                q, self.kv_cache, md, self.scale,
-                self.num_heads, self.num_kv_heads, self.head_dim,
-                self.num_queries_per_kv,
-            )
+            return paged_decode_attention(q, self.kv_cache, md.block_tables, md.seq_lens, self.scale)
         return _paged_attention_torch(q, self.kv_cache, md, self.scale,
                                       self.num_queries_per_kv)
 
