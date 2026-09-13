@@ -345,197 +345,81 @@ The small model is not bandwidth-bound or launch-bound after graphs. It is bound
 ---
 # Codebase
 
-sequence.py
-
+## babyvllm/__init__.py
 ```python
-import itertools
-from enum import Enum, auto
-from dataclasses import dataclass, field
+from babyvllm.llm import LLM
+from babyvllm.sequence import SamplingParams
 
-@dataclass
-class SamplingParams:
-    temperature: float = 1.0
-    top_p: float = 1.0
-    ignore_eos: bool = False
-    max_tokens: int = 256
-    stop_tokens: set[int] = field(default_factory=set)
-
-
-class SequenceState(Enum):
-    WAITING = auto()
-    RUNNING = auto()
-    DONE = auto()
-
-class SequenceFinishReason(str, Enum):
-    STOP = "stop"
-    LENGTH = "length"
-    ABORT = "abort"
-
-class Sequence:
-    _counter = itertools.count()
-
-    def __init__(self, token_ids: list[int], sampling_params: SamplingParams | None = None):
-        if not token_ids:
-            raise ValueError("Prompt cannot be empty")
-        self.seq_id = next(Sequence._counter)
-        self.token_ids = list(token_ids)
-        self.sampling_params = sampling_params or SamplingParams()
-        self.status = SequenceState.WAITING
-        self.finish_reason = None
-        self._prompt_len = len(token_ids)
-        self.num_computed_tokens: int = 0
-
-
-    def __len__(self):
-        return len(self.token_ids)
-
-    def __getitem__(self, item):
-        return self.token_ids[item]
-
-    def __repr__(self) -> str:
-        return (f"Sequence(id={self.seq_id}, {self.status.name}, "
-                f"prompt={self._prompt_len}, total={len(self)}, "
-                f"computed={self.num_computed_tokens})")
-
-    @property
-    def output_token_ids(self) -> list[int]:
-        return self.token_ids[self._prompt_len:]
-
-    def append_token(self, token_id: int) -> None:
-        self.token_ids.append(token_id)
-
-    def advance_computed(self, n: int) -> None:
-        self.num_computed_tokens += n
-        if self.num_computed_tokens > len(self.token_ids):
-            raise ValueError(f"Computed tokens ({self.num_computed_tokens}) exceeds sequence length ({len(self.token_ids)})")
-
-    @property
-    def prompt_len(self) -> int:
-        return self._prompt_len
-
-    @property
-    def generated_token_len(self) -> int:
-        return len(self.token_ids) - self.prompt_len
-
-    @property
-    def num_tokens_to_compute(self) -> int:
-        return len(self.token_ids) - self.num_computed_tokens
-
-    @property
-    def is_finished(self) -> bool:
-        return self.status == SequenceState.DONE
-
-    @property
-    def last_token_id(self):
-        return self.token_ids[-1]
-
-    def finish(self, reason: SequenceFinishReason) -> None:
-        self.status = SequenceState.DONE
-        self.finish_reason = reason
-
-    def reset_for_recompute(self) -> None:
-        self.status = SequenceState.WAITING
-        self.num_computed_tokens = 0
+__all__ = ["LLM", "SamplingParams"]
 ```
 
-kv_cache_manager.py
-
+## babyvllm/config.py
 ```python
-from collections import deque
-from babyvllm.sequence import Sequence
-
-_DUMMY_BLOCK = 0
-
-class KVCacheManager:
-    def __init__(self, num_blocks: int, block_size: int):
-        assert num_blocks > 0, "num_blocks must be > 0"
-        assert block_size > 0, "block_size must be > 0"
-        
-        self.num_blocks = num_blocks
-        self.block_size = block_size
-        self.free_block_ids = deque(range(num_blocks))
-
-        self.used_block_ids = set()
-        self.request_blocks: dict[int, list[int]] = {}
-
-    @property
-    def num_free_blocks(self) -> int:
-        return len(self.free_block_ids)
-
-    def reset(self):
-        self.free_block_ids = deque(range(self.num_blocks))
-        self.used_block_ids.clear()
-        self.request_blocks.clear()
-
-    def _check_invariants(self):
-        assert self.num_free_blocks + len(self.used_block_ids) == self.num_blocks
-
-    def get_block_table(self, seq: Sequence) -> list[int]:
-        return self.request_blocks.get(seq.seq_id, [])
-
-    def get_slot_mapping(self, seq: Sequence, num_new_tokens: int) -> list[int]:
-        table = self.request_blocks.get(seq.seq_id, [])
-        start = seq.num_computed_tokens
-        out = []
-        for pos in range(start, start + num_new_tokens):
-            b, o = divmod(pos, self.block_size)
-            assert b < len(table), f"seq {seq.seq_id} pos {pos} has no block"
-            out.append(table[b] * self.block_size + o)
-        return out
-
-    def num_blocks_needed(self, seq: Sequence, num_new_tokens: int) -> int:
-        target_num_computed_tokens = seq.num_computed_tokens + num_new_tokens
-        target_num_logical_blocks = (target_num_computed_tokens + self.block_size - 1) // self.block_size
-        return max(0, target_num_logical_blocks - len(self.request_blocks.get(seq.seq_id, [])))
-
-    def can_allocate(self, seq: Sequence, num_new_tokens: int) -> bool:
-        return self.num_free_blocks >= self.num_blocks_needed(seq, num_new_tokens)
-
-    def allocate_slots(self, seq: Sequence, num_new_tokens: int) -> None:
-        needed = self.num_blocks_needed(seq, num_new_tokens)
-        
-        assert self.can_allocate(seq, num_new_tokens), f"OOM: cannot allocate for seq {seq.seq_id}. Free: {self.num_free_blocks}, needed: {needed}"
-
-        if seq.seq_id not in self.request_blocks:
-            self.request_blocks[seq.seq_id] = []
-
-        for _ in range(needed):
-            block_id = self.free_block_ids.popleft()
-            self.used_block_ids.add(block_id)
-            self.request_blocks[seq.seq_id].append(block_id)
-
-    def free(self, seq: Sequence): 
-        assert seq.seq_id in self.request_blocks, f"free() called on seq {seq.seq_id} with no allocated blocks. Double-free or free-without-allocate."
-
-        for block_id in self.request_blocks[seq.seq_id]:
-            self.used_block_ids.remove(block_id)
-            self.free_block_ids.append(block_id)
-
-        del self.request_blocks[seq.seq_id]
-
-    def free_if_allocated(self, seq: Sequence):
-        if seq.seq_id in self.request_blocks:
-            self.free(seq)
-```
-
-config.py
-
-```python
+import json
+import os
 from dataclasses import dataclass
+
+from huggingface_hub import hf_hub_download
+
+# Published numbers: this model, bf16, H100. 0.5B is tests/kernel iteration only.
+PUBLISHED_MODEL = "Qwen/Qwen2.5-7B"
+DEV_MODEL = "Qwen/Qwen2.5-0.5B"
+
 
 @dataclass
 class ModelConfig:
-    vocab_size: int = 151936
-    hidden_size: int = 896
-    intermediate_size: int = 4864
-    num_hidden_layers: int = 24
-    num_attention_heads: int = 14
-    num_key_value_heads: int = 2
-    rms_norm_eps: float = 1e-6
-    max_position_embeddings: int = 32768
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    rms_norm_eps: float
+    max_position_embeddings: int
+    rope_theta: float
+    tie_word_embeddings: bool
     block_size: int = 16
-    rope_theta: float = 1000000.0
-    tie_word_embeddings: bool = True
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_attention_heads
+
+    @property
+    def kv_bytes_per_token(self) -> int:
+        # K+V, all layers, bf16. Published numbers are always bf16.
+        return 2 * self.num_hidden_layers * self.num_key_value_heads * self.head_dim * 2
+
+    @classmethod
+    def from_hf(cls, path: str, block_size: int = 16) -> "ModelConfig":
+        with open(os.path.join(path, "config.json")) as f:
+            c = json.load(f)
+        assert c["architectures"] == ["Qwen2ForCausalLM"], c["architectures"]
+        hidden = c["hidden_size"]
+        n_heads = c["num_attention_heads"]
+        assert hidden % n_heads == 0, (hidden, n_heads)
+        return cls(
+            vocab_size=c["vocab_size"],
+            hidden_size=hidden,
+            intermediate_size=c["intermediate_size"],
+            num_hidden_layers=c["num_hidden_layers"],
+            num_attention_heads=n_heads,
+            num_key_value_heads=c["num_key_value_heads"],
+            rms_norm_eps=c["rms_norm_eps"],
+            max_position_embeddings=c["max_position_embeddings"],
+            rope_theta=c["rope_theta"],
+            tie_word_embeddings=c.get("tie_word_embeddings", False),
+            block_size=block_size,
+        )
+
+
+def load_model_config(model: str | None = None, block_size: int = 16) -> ModelConfig:
+    """Read architecture from checkpoint config.json. Never from hardcoded dims."""
+    model = model or os.environ.get("BABYVLLM_MODEL", PUBLISHED_MODEL)
+    if os.path.isdir(model):
+        return ModelConfig.from_hf(model, block_size=block_size)
+    cfg_file = hf_hub_download(repo_id=model, filename="config.json")
+    return ModelConfig.from_hf(os.path.dirname(cfg_file), block_size=block_size)
+
 
 @dataclass
 class CacheConfig:
@@ -543,171 +427,14 @@ class CacheConfig:
     num_gpu_blocks: int = 100
     num_cpu_blocks: int = 100
 
+
 @dataclass
 class SchedulerConfig:
     max_num_seqs: int = 256
     max_num_batched_tokens: int = 2048
 ```
 
-scheduler.py
-
-```python
-from collections import deque
-from dataclasses import dataclass
-from babyvllm.sequence import Sequence, SequenceState, SequenceFinishReason
-from babyvllm.kv_cache_manager import KVCacheManager
-
-@dataclass
-class SchedulerOutput:
-    scheduled_sequences: list[Sequence]
-    num_scheduled_tokens: dict[int, int]
-    block_tables: dict[int, list[int]]
-    slot_mappings: dict[int, list[int]]
-    preempted_seqs: list[Sequence]
-
-class Scheduler:
-    def __init__(self, kv_cache_manager: KVCacheManager, max_num_batched_tokens: int = 2048, max_num_seqs: int = 256):
-        
-        
-        self.kv_cache_manager = kv_cache_manager
-        self.max_num_batched_tokens = max_num_batched_tokens
-        self.max_num_seqs = max_num_seqs
-        self.waiting: deque[Sequence] = deque()
-        self.running: list[Sequence] = []
-        self.finished_seqs: list[Sequence] = []
-
-    def _finish(self, seq: Sequence, reason: SequenceFinishReason) -> None:
-        seq.finish(reason)
-        self.free_seq(seq)
-        self.finished_seqs.append(seq)
-
-    def pop_finished(self) -> list[Sequence]:
-        out, self.finished_seqs = self.finished_seqs, []
-        return out
-
-    def has_unfinished(self) -> bool:
-        return bool(self.waiting or self.running)
-
-    def add_seq(self, seq: Sequence):
-        if len(seq) > self.max_num_batched_tokens:
-            self._finish(seq, SequenceFinishReason.LENGTH)
-            return
-            
-        if self.kv_cache_manager.num_blocks_needed(seq, len(seq)) > self.kv_cache_manager.num_blocks:
-            self._finish(seq, SequenceFinishReason.LENGTH)
-            return
-            
-        seq.status = SequenceState.WAITING
-        self.waiting.append(seq)
-
-    def admit_seq(self, seq: Sequence):
-        popped = self.waiting.popleft()
-        assert popped == seq
-        seq.status = SequenceState.RUNNING
-        self.running.append(seq)
-
-    def abort_seq(self, seq: Sequence):
-        self._finish(seq, SequenceFinishReason.ABORT)
-
-    def free_seq(self, seq: Sequence):
-        if seq in self.running:
-            self.running.remove(seq)
-        elif seq in self.waiting:
-            self.waiting.remove(seq)
-        
-        self.kv_cache_manager.free_if_allocated(seq)
-
-    def update_from_output(self, scheduler_output: SchedulerOutput, model_output: dict[int, int]):
-        for seq in scheduler_output.scheduled_sequences:
-            num_scheduled = scheduler_output.num_scheduled_tokens[seq.seq_id]
-            seq.advance_computed(num_scheduled)
-            if seq.seq_id in model_output:
-                token_id = model_output[seq.seq_id]
-                if token_id in seq.sampling_params.stop_tokens:
-                    self._finish(seq, SequenceFinishReason.STOP)
-                else:
-                    seq.append_token(token_id)
-                    if seq.generated_token_len >= seq.sampling_params.max_tokens:
-                        self._finish(seq, SequenceFinishReason.LENGTH)
-
-    def schedule(self) -> SchedulerOutput:
-        budget = self.max_num_batched_tokens
-        scheduled_sequences: list[Sequence] = []
-        num_scheduled_tokens: dict[int, int] = {}
-        block_tables: dict[int, list[int]] = {}
-        slot_mappings: dict[int, list[int]] = {}
-
-        running_seqs = list(self.running)
-        preempted_seqs = []
-        for seq in running_seqs:
-            if seq.status != SequenceState.RUNNING:
-                continue
-            needed = seq.num_tokens_to_compute
-            
-            if budget < needed or len(scheduled_sequences) >= self.max_num_seqs:
-                break
-                
-            while not self.kv_cache_manager.can_allocate(seq, needed):
-                if len(self.running) > 1 and self.running[-1] is not seq:
-                    victim = self.running[-1]
-                    victim.reset_for_recompute()
-                    self.running.remove(victim)
-                    preempted_seqs.append(victim)
-                    self.kv_cache_manager.free_if_allocated(victim)
-                else:
-                    seq.reset_for_recompute()
-                    self.running.remove(seq)
-                    preempted_seqs.append(seq)
-                    self.kv_cache_manager.free_if_allocated(seq)
-                    break
-            else:
-                self.kv_cache_manager.allocate_slots(seq, needed)
-                scheduled_sequences.append(seq)
-                num_scheduled_tokens[seq.seq_id] = needed
-                block_tables[seq.seq_id] = list(self.kv_cache_manager.get_block_table(seq))
-                slot_mappings[seq.seq_id] = self.kv_cache_manager.get_slot_mapping(seq, needed)
-                budget -= needed
-
-        for seq in reversed(preempted_seqs):
-            self.waiting.appendleft(seq)
-
-        while self.waiting:
-            seq = self.waiting[0]
-            if len(scheduled_sequences) >= self.max_num_seqs:
-                break
-                
-            needed = seq.num_tokens_to_compute
-            
-            if needed > self.max_num_batched_tokens:
-                self._finish(seq, SequenceFinishReason.LENGTH)
-                continue
-            
-            if self.kv_cache_manager.num_blocks_needed(seq, needed) > self.kv_cache_manager.num_blocks:
-                self._finish(seq, SequenceFinishReason.LENGTH)
-                continue
-            
-            if budget >= needed and self.kv_cache_manager.can_allocate(seq, needed):
-                self.kv_cache_manager.allocate_slots(seq, needed)
-                self.admit_seq(seq)
-                scheduled_sequences.append(seq)
-                num_scheduled_tokens[seq.seq_id] = needed
-                block_tables[seq.seq_id] = list(self.kv_cache_manager.get_block_table(seq))
-                slot_mappings[seq.seq_id] = self.kv_cache_manager.get_slot_mapping(seq, needed)
-                budget -= needed
-            else:
-                break
-
-        return SchedulerOutput(
-            scheduled_sequences=scheduled_sequences,
-            num_scheduled_tokens=num_scheduled_tokens,
-            block_tables=block_tables,
-            slot_mappings=slot_mappings,
-            preempted_seqs=preempted_seqs,
-        )
-```
-
-engine.py
-
+## babyvllm/engine.py
 ```python
 from dataclasses import dataclass
 
@@ -741,13 +468,12 @@ class LLMEngine:
         max_num_seqs: int = 4,
     ):
         self.model_runner = model_runner
-        num_blocks = getattr(model_runner, "num_blocks", None)
-        if not num_blocks:
-            num_blocks = model_runner.determine_num_blocks()
+        self.block_size = model_runner.block_size
+        num_blocks = model_runner.allocate_kv_cache()
 
         self.kv_cache_manager = KVCacheManager(
             num_blocks=num_blocks,
-            block_size=model_runner.block_size,
+            block_size=self.block_size,
         )
 
         self.scheduler = Scheduler(
@@ -757,8 +483,6 @@ class LLMEngine:
         )
 
         self.sequences: dict[int, Sequence] = {}
-
-        self.block_size = model_runner.block_size
 
     def add_request(
         self,
@@ -886,136 +610,224 @@ class LLMEngine:
         self.sequences.clear()
 ```
 
-llm.py
-
+## babyvllm/kernels/__init__.py
 ```python
-import os
-import torch
-from transformers import AutoTokenizer
-from huggingface_hub import snapshot_download
-
-from babyvllm.config import ModelConfig, CacheConfig, SchedulerConfig
-from babyvllm.engine import LLMEngine
-from babyvllm.worker.model_runner import ModelRunner, pick_device
-from babyvllm.worker.loader import load_model
-from babyvllm.sequence import SamplingParams
-
-class LLM:
-    def __init__(
-        self,
-        model_name: str,
-        cache_config: CacheConfig = None,
-        scheduler_config: SchedulerConfig = None,
-        device=None,
-        verbose: bool = False,
-        use_cuda_graphs: bool | None = None,
-    ):
-        self.model_name = model_name
-        self.verbose = verbose
-        device = torch.device(device) if device is not None else pick_device()
-        self._log(f"Loading {model_name} on {device}...")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        
-        try:
-            from transformers import GenerationConfig
-            gen_cfg = GenerationConfig.from_pretrained(model_name)
-            if isinstance(gen_cfg.eos_token_id, list):
-                self.eos_token_id = set(gen_cfg.eos_token_id)
-            elif isinstance(gen_cfg.eos_token_id, int):
-                self.eos_token_id = {gen_cfg.eos_token_id}
-            else:
-                self.eos_token_id = set()
-        except Exception:
-            if self.tokenizer.eos_token_id is not None:
-                self.eos_token_id = {self.tokenizer.eos_token_id}
-            else:
-                self.eos_token_id = set()
-        
-        if os.path.isdir(model_name):
-            path = model_name
-        else:
-            self._log("Downloading / resolving checkpoint...")
-            path = snapshot_download(repo_id=model_name)
-            self._log(f"Checkpoint ready at {path}")
-        
-        import json
-        with open(f"{path}/config.json", "r") as f:
-            hf_cfg = json.load(f)
-            
-        self.model_config = ModelConfig(
-            vocab_size=hf_cfg.get("vocab_size", 151936),
-            hidden_size=hf_cfg.get("hidden_size", 896),
-            intermediate_size=hf_cfg.get("intermediate_size", 4864),
-            num_hidden_layers=hf_cfg.get("num_hidden_layers", 24),
-            num_attention_heads=hf_cfg.get("num_attention_heads", 14),
-            num_key_value_heads=hf_cfg.get("num_key_value_heads", 2),
-            rms_norm_eps=hf_cfg.get("rms_norm_eps", 1e-6),
-            max_position_embeddings=hf_cfg.get("max_position_embeddings", 32768),
-            rope_theta=hf_cfg.get("rope_theta", 1000000.0),
-            tie_word_embeddings=hf_cfg.get("tie_word_embeddings", True),
-        )
-        
-        sched_cfg = scheduler_config or SchedulerConfig()
-        
-        self._log("Building model...")
-        self.model_runner = ModelRunner(
-            self.model_config,
-            cache_config=cache_config,
-            scheduler_config=sched_cfg,
-            device=device,
-            use_cuda_graphs=use_cuda_graphs,
-        )
-        self._log("Loading weights...")
-        load_model(self.model_runner.model, path)
-
-        num_blocks = self.model_runner.allocate_kv_cache()
-        profile = self.model_runner.kv_profile or {}
-        if "peak_memory_gb" in profile:
-            self._log(
-                f"KV profile: peak {profile['peak_memory_gb']:.2f} GB / "
-                f"{profile['total_memory_gb']:.2f} GB, "
-                f"{profile['available_for_kv_gb']:.2f} GB free for cache → "
-                f"{num_blocks} blocks "
-                f"({profile['max_kv_tokens']} tokens)"
-            )
-        else:
-            self._log(f"KV cache: {num_blocks} blocks (CPU/MPS fallback)")
-
-        self.engine = LLMEngine(
-            model_runner=self.model_runner,
-            max_num_batched_tokens=sched_cfg.max_num_batched_tokens,
-            max_num_seqs=sched_cfg.max_num_seqs
-        )
-        if self.model_runner.use_cuda_graphs:
-            self._log("CUDA graphs enabled for decode")
-        self._log("Engine ready.")
-
-    def _log(self, msg: str) -> None:
-        if self.verbose:
-            print(msg, flush=True)
-
-    def generate(self, prompts: list[str], sampling_params=None):
-        import copy
-        if sampling_params is None:
-            sampling_params = SamplingParams(temperature=0.0)
-
-        for prompt in prompts:
-            req_params = copy.copy(sampling_params)
-            if not req_params.ignore_eos:
-                req_params.stop_tokens = set(req_params.stop_tokens) | self.eos_token_id
-            
-            token_ids = self.tokenizer(prompt).input_ids
-            self.engine.add_request(token_ids, req_params)
-            
-        outputs = list(self.engine.run().values())
-        for out in outputs:
-            out.text = self.tokenizer.decode(out.new_token_ids)
-            
-        return outputs
 ```
 
-attention.py
+## babyvllm/kernels/paged_attn.py
+```python
+import torch
+import triton
+import triton.language as tl
 
+@triton.jit
+def paged_decode_attn_kernel(
+    q_ptr, k_cache, v_cache, out_ptr,
+    block_tables, seq_lens, scale,
+    stride_qs, stride_qh, stride_qd,
+    stride_kb, stride_kt, stride_kh, stride_kd,
+    stride_vb, stride_vt, stride_vh, stride_vd,
+    stride_os, stride_oh, stride_od,
+    stride_bts, stride_btb, stride_sl,
+    Q_PER_KV: tl.constexpr, Q_BLOCK: tl.constexpr,
+    HEAD_DIM: tl.constexpr, BLOCK: tl.constexpr,
+    MAX_BLOCKS: tl.constexpr,
+):
+    s = tl.program_id(0)
+    kvh = tl.program_id(1)
+    
+    seq_len = tl.load(seq_lens + s * stride_sl)
+    if seq_len == 0:
+        return
+
+    offs_q = tl.arange(0, Q_BLOCK)
+    offs_d = tl.arange(0, HEAD_DIM)
+    q_mask = offs_q < Q_PER_KV
+
+    q = tl.load(
+        q_ptr
+        + s * stride_qs
+        + (kvh * Q_PER_KV + offs_q)[:, None] * stride_qh
+        + offs_d[None, :] * stride_qd,
+        mask=q_mask[:, None],
+        other=0.0,
+    )
+
+    m = tl.full([Q_BLOCK], float("-inf"), dtype=tl.float32)
+    l = tl.zeros([Q_BLOCK], dtype=tl.float32)
+    acc = tl.zeros([Q_BLOCK, HEAD_DIM], dtype=tl.float32)
+
+    n_blocks = tl.minimum(tl.cdiv(seq_len, BLOCK), MAX_BLOCKS)
+    
+    bt_ptr = block_tables + s * stride_bts
+    phys = tl.load(bt_ptr)
+    
+    offs_n = tl.arange(0, BLOCK)
+    
+    for b in range(0, n_blocks):
+        # Load next phys early to hide latency (software pipelining block table)
+        next_phys = tl.load(bt_ptr + (b + 1) * stride_btb, mask=(b + 1) < n_blocks, other=0)
+        
+        k = tl.load(
+            k_cache
+            + phys * stride_kb
+            + offs_n[:, None] * stride_kt
+            + kvh * stride_kh
+            + offs_d[None, :] * stride_kd,
+        )
+        v = tl.load(
+            v_cache
+            + phys * stride_vb
+            + offs_n[:, None] * stride_vt
+            + kvh * stride_vh
+            + offs_d[None, :] * stride_vd,
+        )
+        
+        # Use tl.dot which runs on Tensor Cores!
+        scores = tl.dot(q, tl.trans(k)) * scale
+        
+        token = b * BLOCK + offs_n
+        mask = (token[None, :] < seq_len) & q_mask[:, None]
+        scores = tl.where(mask, scores, float("-inf"))
+
+        m_new = tl.maximum(m, tl.max(scores, axis=1))
+        alpha = tl.exp(m - m_new)
+        p = tl.exp(scores - m_new[:, None])
+        
+        # Use tl.dot for the value accumulation as well!
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        
+        l = l * alpha + tl.sum(p, axis=1)
+        m = m_new
+        
+        phys = next_phys
+
+    l_safe = tl.where(l == 0, 1.0, l)
+    out = acc / l_safe[:, None]
+    
+    tl.store(
+        out_ptr
+        + s * stride_os
+        + (kvh * Q_PER_KV + offs_q)[:, None] * stride_oh
+        + offs_d[None, :] * stride_od,
+        out.to(out_ptr.dtype.element_ty),
+        mask=q_mask[:, None],
+    )
+
+
+def paged_decode_attention(q, kv_cache, block_tables, seq_lens, scale):
+    B, n_heads, head_dim = q.shape
+    n_kv_heads = kv_cache.shape[3]
+    block_size = kv_cache.shape[2]
+    
+    q_per_kv = n_heads // n_kv_heads
+    
+    # Pad Q_BLOCK to 16 for Tensor Cores (tl.dot requires >= 16)
+    q_block = 16 if q_per_kv <= 16 else triton.next_power_of_2(q_per_kv)
+    
+    out = torch.empty_like(q)
+    k_cache = kv_cache[0]
+    v_cache = kv_cache[1]
+    
+    grid = (B, n_kv_heads)
+    
+    paged_decode_attn_kernel[grid](
+        q, k_cache, v_cache, out,
+        block_tables, seq_lens, float(scale),
+        q.stride(0), q.stride(1), q.stride(2),
+        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
+        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
+        out.stride(0), out.stride(1), out.stride(2),
+        block_tables.stride(0), block_tables.stride(1), seq_lens.stride(0),
+        Q_PER_KV=q_per_kv,
+        Q_BLOCK=q_block,
+        HEAD_DIM=head_dim,
+        BLOCK=block_size,
+        MAX_BLOCKS=block_tables.shape[1],
+        num_warps=4,
+    )
+    return out
+```
+
+## babyvllm/kv_cache_manager.py
+```python
+from collections import deque
+from babyvllm.sequence import Sequence
+
+_DUMMY_BLOCK = 0
+
+class KVCacheManager:
+    def __init__(self, num_blocks: int, block_size: int):
+        assert num_blocks > 0, "num_blocks must be > 0"
+        assert block_size > 0, "block_size must be > 0"
+        
+        self.num_blocks = num_blocks
+        self.block_size = block_size
+        self.free_block_ids = deque(range(num_blocks))
+
+        self.used_block_ids = set()
+        self.request_blocks: dict[int, list[int]] = {}
+
+    @property
+    def num_free_blocks(self) -> int:
+        return len(self.free_block_ids)
+
+    def reset(self):
+        self.free_block_ids = deque(range(self.num_blocks))
+        self.used_block_ids.clear()
+        self.request_blocks.clear()
+
+    def _check_invariants(self):
+        assert self.num_free_blocks + len(self.used_block_ids) == self.num_blocks
+
+    def get_block_table(self, seq: Sequence) -> list[int]:
+        return self.request_blocks.get(seq.seq_id, [])
+
+    def get_slot_mapping(self, seq: Sequence, num_new_tokens: int) -> list[int]:
+        table = self.request_blocks.get(seq.seq_id, [])
+        start = seq.num_computed_tokens
+        out = []
+        for pos in range(start, start + num_new_tokens):
+            b, o = divmod(pos, self.block_size)
+            assert b < len(table), f"seq {seq.seq_id} pos {pos} has no block"
+            out.append(table[b] * self.block_size + o)
+        return out
+
+    def num_blocks_needed(self, seq: Sequence, num_new_tokens: int) -> int:
+        target_num_computed_tokens = seq.num_computed_tokens + num_new_tokens
+        target_num_logical_blocks = (target_num_computed_tokens + self.block_size - 1) // self.block_size
+        return max(0, target_num_logical_blocks - len(self.request_blocks.get(seq.seq_id, [])))
+
+    def can_allocate(self, seq: Sequence, num_new_tokens: int) -> bool:
+        return self.num_free_blocks >= self.num_blocks_needed(seq, num_new_tokens)
+
+    def allocate_slots(self, seq: Sequence, num_new_tokens: int) -> None:
+        needed = self.num_blocks_needed(seq, num_new_tokens)
+        
+        assert self.can_allocate(seq, num_new_tokens), f"OOM: cannot allocate for seq {seq.seq_id}. Free: {self.num_free_blocks}, needed: {needed}"
+
+        if seq.seq_id not in self.request_blocks:
+            self.request_blocks[seq.seq_id] = []
+
+        for _ in range(needed):
+            block_id = self.free_block_ids.popleft()
+            self.used_block_ids.add(block_id)
+            self.request_blocks[seq.seq_id].append(block_id)
+
+    def free(self, seq: Sequence): 
+        assert seq.seq_id in self.request_blocks, f"free() called on seq {seq.seq_id} with no allocated blocks. Double-free or free-without-allocate."
+
+        for block_id in self.request_blocks[seq.seq_id]:
+            self.used_block_ids.remove(block_id)
+            self.free_block_ids.append(block_id)
+
+        del self.request_blocks[seq.seq_id]
+
+    def free_if_allocated(self, seq: Sequence):
+        if seq.seq_id in self.request_blocks:
+            self.free(seq)```
+
+## babyvllm/layers/attention.py
 ```python
 from babyvllm.kernels.paged_attn import paged_decode_attention
 import torch
@@ -1173,8 +985,7 @@ def _naive_causal_attention(q, k, v, scale, num_queries_per_kv):
     return o.transpose(0, 1)
 ```
 
-layernorm.py
-
+## babyvllm/layers/layernorm.py
 ```python
 import torch
 import torch.nn as nn
@@ -1192,8 +1003,7 @@ class RMSNorm(nn.Module):
         return self.weight * x.to(dt)
 ```
 
-rotary.py
-
+## babyvllm/layers/rotary.py
 ```python
 import torch
 import torch.nn as nn
@@ -1229,8 +1039,7 @@ class RotaryEmbedding(nn.Module):
         return cos, sin
 ```
 
-sampler.py
-
+## babyvllm/layers/sampler.py
 ```python
 import torch
 import torch.nn as nn
@@ -1273,8 +1082,119 @@ class Sampler(nn.Module):
         return sampled_tokens
 ```
 
-qwen2.py
+## babyvllm/llm.py
+```python
+import os
+import torch
+from transformers import AutoTokenizer
+from huggingface_hub import snapshot_download
 
+from babyvllm.config import ModelConfig, CacheConfig, SchedulerConfig
+from babyvllm.engine import LLMEngine
+from babyvllm.worker.model_runner import ModelRunner, pick_device
+from babyvllm.worker.loader import load_model
+from babyvllm.sequence import SamplingParams
+
+class LLM:
+    def __init__(
+        self,
+        model_name: str,
+        cache_config: CacheConfig = None,
+        scheduler_config: SchedulerConfig = None,
+        device=None,
+        verbose: bool = False,
+        use_cuda_graphs: bool | None = None,
+    ):
+        self.model_name = model_name
+        self.verbose = verbose
+        device = torch.device(device) if device is not None else pick_device()
+        self._log(f"Loading {model_name} on {device}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        try:
+            from transformers import GenerationConfig
+            gen_cfg = GenerationConfig.from_pretrained(model_name)
+            if isinstance(gen_cfg.eos_token_id, list):
+                self.eos_token_id = set(gen_cfg.eos_token_id)
+            elif isinstance(gen_cfg.eos_token_id, int):
+                self.eos_token_id = {gen_cfg.eos_token_id}
+            else:
+                self.eos_token_id = set()
+        except Exception:
+            if self.tokenizer.eos_token_id is not None:
+                self.eos_token_id = {self.tokenizer.eos_token_id}
+            else:
+                self.eos_token_id = set()
+        
+        if os.path.isdir(model_name):
+            path = model_name
+        else:
+            self._log("Downloading / resolving checkpoint...")
+            path = snapshot_download(repo_id=model_name)
+            self._log(f"Checkpoint ready at {path}")
+
+        cache_cfg = cache_config or CacheConfig()
+        sched_cfg = scheduler_config or SchedulerConfig()
+        self.model_config = ModelConfig.from_hf(path, block_size=cache_cfg.block_size)
+        
+        self._log("Building model...")
+        self.model_runner = ModelRunner(
+            self.model_config,
+            cache_config=cache_cfg,
+            scheduler_config=sched_cfg,
+            device=device,
+            use_cuda_graphs=use_cuda_graphs,
+        )
+        self._log("Loading weights...")
+        load_model(self.model_runner.model, path)
+
+        num_blocks = self.model_runner.allocate_kv_cache()
+        profile = self.model_runner.kv_profile or {}
+        if "peak_memory_gb" in profile:
+            self._log(
+                f"KV profile: peak {profile['peak_memory_gb']:.2f} GB / "
+                f"{profile['total_memory_gb']:.2f} GB, "
+                f"{profile['available_for_kv_gb']:.2f} GB free for cache → "
+                f"{num_blocks} blocks "
+                f"({profile['max_kv_tokens']} tokens)"
+            )
+        else:
+            self._log(f"KV cache: {num_blocks} blocks (CPU/MPS fallback)")
+
+        self.engine = LLMEngine(
+            model_runner=self.model_runner,
+            max_num_batched_tokens=sched_cfg.max_num_batched_tokens,
+            max_num_seqs=sched_cfg.max_num_seqs
+        )
+        if self.model_runner.use_cuda_graphs:
+            self._log("CUDA graphs enabled for decode")
+        self._log("Engine ready.")
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(msg, flush=True)
+
+    def generate(self, prompts: list[str], sampling_params=None):
+        import copy
+        if sampling_params is None:
+            sampling_params = SamplingParams(temperature=0.0)
+
+        for prompt in prompts:
+            req_params = copy.copy(sampling_params)
+            if not req_params.ignore_eos:
+                req_params.stop_tokens = set(req_params.stop_tokens) | self.eos_token_id
+            
+            token_ids = self.tokenizer(prompt).input_ids
+            self.engine.add_request(token_ids, req_params)
+            
+        outputs = list(self.engine.run().values())
+        for out in outputs:
+            out.text = self.tokenizer.decode(out.new_token_ids)
+            
+        return outputs
+```
+
+## babyvllm/models/qwen2.py
 ```python
 import torch
 import torch.nn as nn
@@ -1300,7 +1220,7 @@ class Qwen2Attention(nn.Module):
         self.layer_idx = layer_idx
         self.num_heads = cfg.num_attention_heads
         self.num_kv_heads = cfg.num_key_value_heads
-        self.head_dim = cfg.hidden_size // cfg.num_attention_heads
+        self.head_dim = cfg.head_dim
         
         self.q_proj = nn.Linear(cfg.hidden_size, self.num_heads * self.head_dim, bias=True)
         self.k_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
@@ -1347,7 +1267,7 @@ class Qwen2Model(nn.Module):
         ])
         self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.rotary_emb = RotaryEmbedding(
-            cfg.hidden_size // cfg.num_attention_heads,
+            cfg.head_dim,
             max_position_embeddings=cfg.max_position_embeddings,
             base=cfg.rope_theta
         )
@@ -1378,8 +1298,256 @@ class Qwen2ForCausalLM(nn.Module):
         return self.model(input_ids, positions)
 ```
 
-context.py
+## babyvllm/scheduler.py
+```python
+from collections import deque
+from dataclasses import dataclass
+from babyvllm.sequence import Sequence, SequenceState, SequenceFinishReason
+from babyvllm.kv_cache_manager import KVCacheManager
 
+@dataclass
+class SchedulerOutput:
+    scheduled_sequences: list[Sequence]
+    num_scheduled_tokens: dict[int, int]
+    block_tables: dict[int, list[int]]
+    slot_mappings: dict[int, list[int]]
+    preempted_seqs: list[Sequence]
+
+class Scheduler:
+    def __init__(self, kv_cache_manager: KVCacheManager, max_num_batched_tokens: int = 2048, max_num_seqs: int = 256):
+        
+        
+        self.kv_cache_manager = kv_cache_manager
+        self.max_num_batched_tokens = max_num_batched_tokens
+        self.max_num_seqs = max_num_seqs
+        self.waiting: deque[Sequence] = deque()
+        self.running: list[Sequence] = []
+        self.finished_seqs: list[Sequence] = []
+
+    def _finish(self, seq: Sequence, reason: SequenceFinishReason) -> None:
+        seq.finish(reason)
+        self.free_seq(seq)
+        self.finished_seqs.append(seq)
+
+    def pop_finished(self) -> list[Sequence]:
+        out, self.finished_seqs = self.finished_seqs, []
+        return out
+
+    def has_unfinished(self) -> bool:
+        return bool(self.waiting or self.running)
+
+    def add_seq(self, seq: Sequence):
+        if len(seq) > self.max_num_batched_tokens:
+            self._finish(seq, SequenceFinishReason.LENGTH)
+            return
+            
+        if self.kv_cache_manager.num_blocks_needed(seq, len(seq)) > self.kv_cache_manager.num_blocks:
+            self._finish(seq, SequenceFinishReason.LENGTH)
+            return
+            
+        seq.status = SequenceState.WAITING
+        self.waiting.append(seq)
+
+    def admit_seq(self, seq: Sequence):
+        popped = self.waiting.popleft()
+        assert popped == seq
+        seq.status = SequenceState.RUNNING
+        self.running.append(seq)
+
+    def abort_seq(self, seq: Sequence):
+        self._finish(seq, SequenceFinishReason.ABORT)
+
+    def free_seq(self, seq: Sequence):
+        if seq in self.running:
+            self.running.remove(seq)
+        elif seq in self.waiting:
+            self.waiting.remove(seq)
+        
+        self.kv_cache_manager.free_if_allocated(seq)
+
+    def update_from_output(self, scheduler_output: SchedulerOutput, model_output: dict[int, int]):
+        for seq in scheduler_output.scheduled_sequences:
+            num_scheduled = scheduler_output.num_scheduled_tokens[seq.seq_id]
+            seq.advance_computed(num_scheduled)
+            if seq.seq_id in model_output:
+                token_id = model_output[seq.seq_id]
+                if token_id in seq.sampling_params.stop_tokens:
+                    self._finish(seq, SequenceFinishReason.STOP)
+                else:
+                    seq.append_token(token_id)
+                    if seq.generated_token_len >= seq.sampling_params.max_tokens:
+                        self._finish(seq, SequenceFinishReason.LENGTH)
+
+    def schedule(self) -> SchedulerOutput:
+        budget = self.max_num_batched_tokens
+        scheduled_sequences: list[Sequence] = []
+        num_scheduled_tokens: dict[int, int] = {}
+        block_tables: dict[int, list[int]] = {}
+        slot_mappings: dict[int, list[int]] = {}
+
+        running_seqs = list(self.running)
+        preempted_seqs = []
+        for seq in running_seqs:
+            if seq.status != SequenceState.RUNNING:
+                continue
+            needed = seq.num_tokens_to_compute
+            
+            if budget < needed or len(scheduled_sequences) >= self.max_num_seqs:
+                break
+                
+            while not self.kv_cache_manager.can_allocate(seq, needed):
+                if len(self.running) > 1 and self.running[-1] is not seq:
+                    victim = self.running[-1]
+                    victim.reset_for_recompute()
+                    self.running.remove(victim)
+                    preempted_seqs.append(victim)
+                    self.kv_cache_manager.free_if_allocated(victim)
+                else:
+                    seq.reset_for_recompute()
+                    self.running.remove(seq)
+                    preempted_seqs.append(seq)
+                    self.kv_cache_manager.free_if_allocated(seq)
+                    break
+            else:
+                self.kv_cache_manager.allocate_slots(seq, needed)
+                scheduled_sequences.append(seq)
+                num_scheduled_tokens[seq.seq_id] = needed
+                block_tables[seq.seq_id] = list(self.kv_cache_manager.get_block_table(seq))
+                slot_mappings[seq.seq_id] = self.kv_cache_manager.get_slot_mapping(seq, needed)
+                budget -= needed
+
+        for seq in reversed(preempted_seqs):
+            self.waiting.appendleft(seq)
+
+        while self.waiting:
+            seq = self.waiting[0]
+            if len(scheduled_sequences) >= self.max_num_seqs:
+                break
+                
+            needed = seq.num_tokens_to_compute
+            
+            if needed > self.max_num_batched_tokens:
+                self._finish(seq, SequenceFinishReason.LENGTH)
+                continue
+            
+            if self.kv_cache_manager.num_blocks_needed(seq, needed) > self.kv_cache_manager.num_blocks:
+                self._finish(seq, SequenceFinishReason.LENGTH)
+                continue
+            
+            if budget >= needed and self.kv_cache_manager.can_allocate(seq, needed):
+                self.kv_cache_manager.allocate_slots(seq, needed)
+                self.admit_seq(seq)
+                scheduled_sequences.append(seq)
+                num_scheduled_tokens[seq.seq_id] = needed
+                block_tables[seq.seq_id] = list(self.kv_cache_manager.get_block_table(seq))
+                slot_mappings[seq.seq_id] = self.kv_cache_manager.get_slot_mapping(seq, needed)
+                budget -= needed
+            else:
+                break
+
+        return SchedulerOutput(
+            scheduled_sequences=scheduled_sequences,
+            num_scheduled_tokens=num_scheduled_tokens,
+            block_tables=block_tables,
+            slot_mappings=slot_mappings,
+            preempted_seqs=preempted_seqs,
+        )
+
+```
+
+## babyvllm/sequence.py
+```python
+import itertools
+from enum import Enum, auto
+from dataclasses import dataclass, field
+
+@dataclass
+class SamplingParams:
+    temperature: float = 1.0
+    top_p: float = 1.0
+    ignore_eos: bool = False
+    max_tokens: int = 256
+    stop_tokens: set[int] = field(default_factory=set)
+
+
+class SequenceState(Enum):
+    WAITING = auto()
+    RUNNING = auto()
+    DONE = auto()
+
+class SequenceFinishReason(str, Enum):
+    STOP = "stop"
+    LENGTH = "length"
+    ABORT = "abort"
+
+class Sequence:
+    _counter = itertools.count()
+
+    def __init__(self, token_ids: list[int], sampling_params: SamplingParams | None = None):
+        if not token_ids:
+            raise ValueError("Prompt cannot be empty")
+        self.seq_id = next(Sequence._counter)
+        self.token_ids = list(token_ids)
+        self.sampling_params = sampling_params or SamplingParams()
+        self.status = SequenceState.WAITING
+        self.finish_reason = None
+        self._prompt_len = len(token_ids)
+        self.num_computed_tokens: int = 0
+
+
+    def __len__(self):
+        return len(self.token_ids)
+
+    def __getitem__(self, item):
+        return self.token_ids[item]
+
+    def __repr__(self) -> str:
+        return (f"Sequence(id={self.seq_id}, {self.status.name}, "
+                f"prompt={self._prompt_len}, total={len(self)}, "
+                f"computed={self.num_computed_tokens})")
+
+    @property
+    def output_token_ids(self) -> list[int]:
+        return self.token_ids[self._prompt_len:]
+
+    def append_token(self, token_id: int) -> None:
+        self.token_ids.append(token_id)
+
+    def advance_computed(self, n: int) -> None:
+        self.num_computed_tokens += n
+        if self.num_computed_tokens > len(self.token_ids):
+            raise ValueError(f"Computed tokens ({self.num_computed_tokens}) exceeds sequence length ({len(self.token_ids)})")
+
+    @property
+    def prompt_len(self) -> int:
+        return self._prompt_len
+
+    @property
+    def generated_token_len(self) -> int:
+        return len(self.token_ids) - self.prompt_len
+
+    @property
+    def num_tokens_to_compute(self) -> int:
+        return len(self.token_ids) - self.num_computed_tokens
+
+    @property
+    def is_finished(self) -> bool:
+        return self.status == SequenceState.DONE
+
+    @property
+    def last_token_id(self):
+        return self.token_ids[-1]
+
+    def finish(self, reason: SequenceFinishReason) -> None:
+        self.status = SequenceState.DONE
+        self.finish_reason = reason
+
+    def reset_for_recompute(self) -> None:
+        self.status = SequenceState.WAITING
+        self.num_computed_tokens = 0
+```
+
+## babyvllm/worker/context.py
 ```python
 from dataclasses import dataclass
 from contextlib import contextmanager
@@ -1418,8 +1586,36 @@ def get_forward_context() -> ForwardContext | None:
     return _FORWARD_CTX
 ```
 
-loader.py
+## babyvllm/worker/graph_runner.py
+```python
+from __future__ import annotations
 
+import torch
+
+
+class CUDAGraphRunner:
+
+    def __init__(self):
+        self._graph: torch.cuda.CUDAGraph | None = None
+
+    @property
+    def pool(self):
+        if self._graph is None:
+            raise RuntimeError("Call capture() first")
+        return self._graph.pool()
+
+    def capture(self, fn, buf, batch_bucket: int, ctx_bucket: int, pool=None):
+        self._graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self._graph, pool=pool):
+            fn(buf, batch_bucket, ctx_bucket)
+
+    def replay(self):
+        if self._graph is None:
+            raise RuntimeError("Call capture() before replay()")
+        self._graph.replay()
+```
+
+## babyvllm/worker/loader.py
 ```python
 import os, glob, torch
 from safetensors import safe_open
@@ -1444,8 +1640,7 @@ def load_model(model: torch.nn.Module, path: str):
         raise RuntimeError(f"uninitialised params: {sorted(missing)}")
 ```
 
-model_runner.py
-
+## babyvllm/worker/model_runner.py
 ```python
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1969,8 +2164,7 @@ class ModelRunner:
         return self._execute_eager(scheduler_output)
 ```
 
-test_attention.py
-
+## tests/test_attention.py
 ```python
 import torch
 import torch.nn.functional as F
@@ -2232,8 +2426,23 @@ if __name__ == "__main__":
     print("All attention tests passed!")
 ```
 
-test_generation.py
+## tests/test_cuda_graphs.py
+```python
+from babyvllm.worker.model_runner import BATCH_BUCKETS, CTX_BUCKETS, ceil_to_bucket
 
+
+def test_ceil_to_bucket():
+    assert ceil_to_bucket(1, BATCH_BUCKETS) == 1
+    assert ceil_to_bucket(3, BATCH_BUCKETS) == 4
+    assert ceil_to_bucket(64, BATCH_BUCKETS) == 64
+    assert ceil_to_bucket(65, BATCH_BUCKETS) is None
+    assert ceil_to_bucket(128, CTX_BUCKETS) == 256
+    assert ceil_to_bucket(256, CTX_BUCKETS) == 256
+    assert ceil_to_bucket(257, CTX_BUCKETS) == 2048
+    assert ceil_to_bucket(2049, CTX_BUCKETS) is None
+```
+
+## tests/test_generation.py
 ```python
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -2279,8 +2488,7 @@ if __name__ == "__main__":
     test_e2e_generation()
 ```
 
-test_parity.py
-
+## tests/test_parity.py
 ```python
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -2316,8 +2524,98 @@ if __name__ == "__main__":
     test_parity()
 ```
 
-test_sampler.py
+## tests/test_parity_7b.py
+```python
+"""Qwen2.5-7B bf16 GPU parity. Not part of default CI.
 
+    BABYVLLM_RUN_7B=1 pytest tests/test_parity_7b.py -m gpu
+"""
+import os
+
+import pytest
+import torch
+from huggingface_hub import snapshot_download
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from babyvllm.config import PUBLISHED_MODEL
+from babyvllm.llm import LLM
+from babyvllm.sequence import SamplingParams
+
+pytestmark = pytest.mark.gpu
+
+
+def _published_path() -> str:
+    allow_download = os.environ.get("BABYVLLM_RUN_7B") == "1"
+    try:
+        return snapshot_download(
+            repo_id=PUBLISHED_MODEL, local_files_only=not allow_download
+        )
+    except Exception as e:
+        pytest.skip(
+            f"{PUBLISHED_MODEL} not in cache (set BABYVLLM_RUN_7B=1 to download): {e}"
+        )
+
+
+@pytest.fixture(scope="module")
+def published_path():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for 7B tests")
+    return _published_path()
+
+
+@pytest.fixture(scope="module")
+def llm_7b(published_path):
+    return LLM(published_path, device="cuda", use_cuda_graphs=False)
+
+
+def test_qwen25_7b_loads_untied_lm_head(llm_7b):
+    cfg = llm_7b.model_config
+    assert cfg.hidden_size == 3584
+    assert cfg.num_hidden_layers == 28
+    assert cfg.num_attention_heads == 28
+    assert cfg.num_key_value_heads == 4
+    assert cfg.head_dim == 128
+    assert cfg.vocab_size == 152064
+    assert cfg.tie_word_embeddings is False
+    assert cfg.num_attention_heads // cfg.num_key_value_heads == 7
+    model = llm_7b.model_runner.model
+    assert model.lm_head is not None
+    assert tuple(model.lm_head.weight.shape) == (152064, 3584)
+    caches = [
+        m.kv_cache
+        for m in model.modules()
+        if m.__class__.__name__ == "Attention"
+    ]
+    assert caches and all(c is not None for c in caches)
+
+
+def test_parity_7b_logits_and_greedy_ids(llm_7b, published_path):
+    device = torch.device("cuda")
+    hf = AutoModelForCausalLM.from_pretrained(
+        published_path, torch_dtype=torch.bfloat16
+    ).to(device).eval()
+    tok = AutoTokenizer.from_pretrained(published_path)
+    prompt = "The capital of France is"
+    ids = tok(prompt, return_tensors="pt").input_ids[0].to(device)
+    positions = torch.arange(len(ids), device=device)
+    mine = llm_7b.model_runner.model
+
+    with torch.inference_mode():
+        ref = hf(ids[None]).logits[0]
+        hidden = mine(ids, positions)
+        got = mine.compute_logits(hidden)
+
+    torch.testing.assert_close(got.float(), ref.float(), atol=2e-2, rtol=2e-2)
+    assert int(got[-1].argmax()) == int(ref[-1].argmax())
+
+    params = SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True)
+    ours = llm_7b.generate([prompt], sampling_params=params)
+    with torch.inference_mode():
+        hf_ids = hf.generate(ids[None], max_new_tokens=8, do_sample=False)[0, ids.shape[0]:]
+    assert ours[0].new_token_ids == hf_ids.tolist()
+```
+
+## tests/test_sampler.py
 ```python
 import torch
 import torch.nn.functional as F
@@ -2395,191 +2693,7 @@ def test_top_p_edge_cases():
     torch.testing.assert_close(actual, expected)
 ```
 
-graph_runner.py
-
-```python
-from __future__ import annotations
-
-import torch
-
-
-class CUDAGraphRunner:
-
-    def __init__(self):
-        self._graph: torch.cuda.CUDAGraph | None = None
-
-    @property
-    def pool(self):
-        if self._graph is None:
-            raise RuntimeError("Call capture() first")
-        return self._graph.pool()
-
-    def capture(self, fn, buf, batch_bucket: int, ctx_bucket: int, pool=None):
-        self._graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self._graph, pool=pool):
-            fn(buf, batch_bucket, ctx_bucket)
-
-    def replay(self):
-        if self._graph is None:
-            raise RuntimeError("Call capture() before replay()")
-        self._graph.replay()
-```
-
-test_cuda_graphs.py
-
-```python
-from babyvllm.worker.model_runner import BATCH_BUCKETS, CTX_BUCKETS, ceil_to_bucket
-
-
-def test_ceil_to_bucket():
-    assert ceil_to_bucket(1, BATCH_BUCKETS) == 1
-    assert ceil_to_bucket(3, BATCH_BUCKETS) == 4
-    assert ceil_to_bucket(64, BATCH_BUCKETS) == 64
-    assert ceil_to_bucket(65, BATCH_BUCKETS) is None
-    assert ceil_to_bucket(128, CTX_BUCKETS) == 256
-    assert ceil_to_bucket(256, CTX_BUCKETS) == 256
-    assert ceil_to_bucket(257, CTX_BUCKETS) == 2048
-    assert ceil_to_bucket(2049, CTX_BUCKETS) is None
-```
-
-paged_attn.py
-
-```python
-import torch
-import triton
-import triton.language as tl
-
-@triton.jit
-def paged_decode_attn_kernel(
-    q_ptr, k_cache, v_cache, out_ptr,
-    block_tables, seq_lens, scale,
-    stride_qs, stride_qh, stride_qd,
-    stride_kb, stride_kt, stride_kh, stride_kd,
-    stride_vb, stride_vt, stride_vh, stride_vd,
-    stride_os, stride_oh, stride_od,
-    stride_bts, stride_btb, stride_sl,
-    Q_PER_KV: tl.constexpr, Q_BLOCK: tl.constexpr,
-    HEAD_DIM: tl.constexpr, BLOCK: tl.constexpr,
-    MAX_BLOCKS: tl.constexpr,
-):
-    s = tl.program_id(0)
-    kvh = tl.program_id(1)
-    
-    seq_len = tl.load(seq_lens + s * stride_sl)
-    if seq_len == 0:
-        return
-
-    offs_q = tl.arange(0, Q_BLOCK)
-    offs_d = tl.arange(0, HEAD_DIM)
-    q_mask = offs_q < Q_PER_KV
-
-    q = tl.load(
-        q_ptr
-        + s * stride_qs
-        + (kvh * Q_PER_KV + offs_q)[:, None] * stride_qh
-        + offs_d[None, :] * stride_qd,
-        mask=q_mask[:, None],
-        other=0.0,
-    )
-
-    m = tl.full([Q_BLOCK], float("-inf"), dtype=tl.float32)
-    l = tl.zeros([Q_BLOCK], dtype=tl.float32)
-    acc = tl.zeros([Q_BLOCK, HEAD_DIM], dtype=tl.float32)
-
-    n_blocks = tl.minimum(tl.cdiv(seq_len, BLOCK), MAX_BLOCKS)
-    
-    bt_ptr = block_tables + s * stride_bts
-    phys = tl.load(bt_ptr)
-    
-    offs_n = tl.arange(0, BLOCK)
-    
-    for b in range(0, n_blocks):
-        # Load next phys early to hide latency (software pipelining block table)
-        next_phys = tl.load(bt_ptr + (b + 1) * stride_btb, mask=(b + 1) < n_blocks, other=0)
-        
-        k = tl.load(
-            k_cache
-            + phys * stride_kb
-            + offs_n[:, None] * stride_kt
-            + kvh * stride_kh
-            + offs_d[None, :] * stride_kd,
-        )
-        v = tl.load(
-            v_cache
-            + phys * stride_vb
-            + offs_n[:, None] * stride_vt
-            + kvh * stride_vh
-            + offs_d[None, :] * stride_vd,
-        )
-        
-        # Use tl.dot which runs on Tensor Cores!
-        scores = tl.dot(q, tl.trans(k)) * scale
-        
-        token = b * BLOCK + offs_n
-        mask = (token[None, :] < seq_len) & q_mask[:, None]
-        scores = tl.where(mask, scores, float("-inf"))
-
-        m_new = tl.maximum(m, tl.max(scores, axis=1))
-        alpha = tl.exp(m - m_new)
-        p = tl.exp(scores - m_new[:, None])
-        
-        # Use tl.dot for the value accumulation as well!
-        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-        
-        l = l * alpha + tl.sum(p, axis=1)
-        m = m_new
-        
-        phys = next_phys
-
-    l_safe = tl.where(l == 0, 1.0, l)
-    out = acc / l_safe[:, None]
-    
-    tl.store(
-        out_ptr
-        + s * stride_os
-        + (kvh * Q_PER_KV + offs_q)[:, None] * stride_oh
-        + offs_d[None, :] * stride_od,
-        out.to(out_ptr.dtype.element_ty),
-        mask=q_mask[:, None],
-    )
-
-
-def paged_decode_attention(q, kv_cache, block_tables, seq_lens, scale):
-    B, n_heads, head_dim = q.shape
-    n_kv_heads = kv_cache.shape[3]
-    block_size = kv_cache.shape[2]
-    
-    q_per_kv = n_heads // n_kv_heads
-    
-    # Pad Q_BLOCK to 16 for Tensor Cores (tl.dot requires >= 16)
-    q_block = 16 if q_per_kv <= 16 else triton.next_power_of_2(q_per_kv)
-    
-    out = torch.empty_like(q)
-    k_cache = kv_cache[0]
-    v_cache = kv_cache[1]
-    
-    grid = (B, n_kv_heads)
-    
-    paged_decode_attn_kernel[grid](
-        q, k_cache, v_cache, out,
-        block_tables, seq_lens, float(scale),
-        q.stride(0), q.stride(1), q.stride(2),
-        k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
-        v_cache.stride(0), v_cache.stride(1), v_cache.stride(2), v_cache.stride(3),
-        out.stride(0), out.stride(1), out.stride(2),
-        block_tables.stride(0), block_tables.stride(1), seq_lens.stride(0),
-        Q_PER_KV=q_per_kv,
-        Q_BLOCK=q_block,
-        HEAD_DIM=head_dim,
-        BLOCK=block_size,
-        MAX_BLOCKS=block_tables.shape[1],
-        num_warps=4,
-    )
-    return out
-```
-
-test_scheduler.py
-
+## tests/test_scheduler.py
 ```python
 import pytest
 from babyvllm.scheduler import Scheduler
@@ -2699,3 +2813,4 @@ def test_eos_stop():
     assert seq_out.finish_reason == SequenceFinishReason.STOP
     assert runner.eos_id not in seq_out.new_token_ids
 ```
+
