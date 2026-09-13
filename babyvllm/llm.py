@@ -46,30 +46,15 @@ class LLM:
             self._log("Downloading / resolving checkpoint...")
             path = snapshot_download(repo_id=model_name)
             self._log(f"Checkpoint ready at {path}")
-        
-        import json
-        with open(f"{path}/config.json", "r") as f:
-            hf_cfg = json.load(f)
-            
-        self.model_config = ModelConfig(
-            vocab_size=hf_cfg.get("vocab_size", 151936),
-            hidden_size=hf_cfg.get("hidden_size", 896),
-            intermediate_size=hf_cfg.get("intermediate_size", 4864),
-            num_hidden_layers=hf_cfg.get("num_hidden_layers", 24),
-            num_attention_heads=hf_cfg.get("num_attention_heads", 14),
-            num_key_value_heads=hf_cfg.get("num_key_value_heads", 2),
-            rms_norm_eps=hf_cfg.get("rms_norm_eps", 1e-6),
-            max_position_embeddings=hf_cfg.get("max_position_embeddings", 32768),
-            rope_theta=hf_cfg.get("rope_theta", 1000000.0),
-            tie_word_embeddings=hf_cfg.get("tie_word_embeddings", True),
-        )
-        
+
+        cache_cfg = cache_config or CacheConfig()
         sched_cfg = scheduler_config or SchedulerConfig()
+        self.model_config = ModelConfig.from_hf(path, block_size=cache_cfg.block_size)
         
         self._log("Building model...")
         self.model_runner = ModelRunner(
             self.model_config,
-            cache_config=cache_config,
+            cache_config=cache_cfg,
             scheduler_config=sched_cfg,
             device=device,
             use_cuda_graphs=use_cuda_graphs,

@@ -22,7 +22,7 @@ class Qwen2Attention(nn.Module):
         self.layer_idx = layer_idx
         self.num_heads = cfg.num_attention_heads
         self.num_kv_heads = cfg.num_key_value_heads
-        self.head_dim = cfg.hidden_size // cfg.num_attention_heads
+        self.head_dim = cfg.head_dim
         
         self.q_proj = nn.Linear(cfg.hidden_size, self.num_heads * self.head_dim, bias=True)
         self.k_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
@@ -69,7 +69,7 @@ class Qwen2Model(nn.Module):
         ])
         self.norm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.rotary_emb = RotaryEmbedding(
-            cfg.hidden_size // cfg.num_attention_heads,
+            cfg.head_dim,
             max_position_embeddings=cfg.max_position_embeddings,
             base=cfg.rope_theta
         )

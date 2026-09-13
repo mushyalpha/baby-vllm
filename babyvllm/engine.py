@@ -30,13 +30,12 @@ class LLMEngine:
         max_num_seqs: int = 4,
     ):
         self.model_runner = model_runner
-        num_blocks = getattr(model_runner, "num_blocks", None)
-        if not num_blocks:
-            num_blocks = model_runner.determine_num_blocks()
+        self.block_size = model_runner.block_size
+        num_blocks = model_runner.allocate_kv_cache()
 
         self.kv_cache_manager = KVCacheManager(
             num_blocks=num_blocks,
-            block_size=model_runner.block_size,
+            block_size=self.block_size,
         )
 
         self.scheduler = Scheduler(
@@ -46,8 +45,6 @@ class LLMEngine:
         )
 
         self.sequences: dict[int, Sequence] = {}
-
-        self.block_size = model_runner.block_size
 
     def add_request(
         self,
