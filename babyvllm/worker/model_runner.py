@@ -71,12 +71,12 @@ class StaticBuffers:
     query_start_loc: torch.Tensor
     logits: torch.Tensor
     # Pinned CPU staging buffers
-    cpu_input_ids: torch.Tensor
-    cpu_position_ids: torch.Tensor
-    cpu_seq_lens: torch.Tensor
-    cpu_context_lens: torch.Tensor
-    cpu_slot_mapping: torch.Tensor
-    cpu_block_tables: torch.Tensor
+    cpu_input_ids: torch.Tensor = None
+    cpu_position_ids: torch.Tensor = None
+    cpu_seq_lens: torch.Tensor = None
+    cpu_context_lens: torch.Tensor = None
+    cpu_slot_mapping: torch.Tensor = None
+    cpu_block_tables: torch.Tensor = None
 
 
 class ModelRunner:
@@ -117,7 +117,7 @@ class ModelRunner:
         self.max_blocks_per_seq = (max_ctx + self.block_size - 1) // self.block_size + 1
 
     def _bytes_per_token(self) -> int:
-        head_dim = self.model_config.hidden_size // self.model_config.num_attention_heads
+        head_dim = self.model_config.head_dim
         bytes_per_element = 2 if self.dtype in (torch.float16, torch.bfloat16) else 4
         return (
             2
@@ -160,7 +160,7 @@ class ModelRunner:
         slack = 256 * 1024 * 1024
         pool_reserve = 0
         if self.use_cuda_graphs:
-            head_dim = self.model_config.hidden_size // self.model_config.num_attention_heads
+            head_dim = self.model_config.head_dim
             pool_reserve = compute_pool_reserve(
                 max(BATCH_BUCKETS),
                 max(CTX_BUCKETS),
@@ -191,7 +191,7 @@ class ModelRunner:
 
     def _alloc_kv_tensors(self, num_blocks: int) -> None:
         num_kv_heads = self.model_config.num_key_value_heads
-        head_dim = self.model_config.hidden_size // self.model_config.num_attention_heads
+        head_dim = self.model_config.head_dim
         for module in self.model.modules():
             if isinstance(module, Attention):
                 module.kv_cache = torch.empty(
