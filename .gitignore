@@ -13,3 +13,5 @@ CODE.md
 *.md
 patch_*.py
 .env
+.cursor/
+
