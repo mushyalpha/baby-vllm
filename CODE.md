@@ -825,7 +825,7 @@ class KVCacheManager:
 
     def free_if_allocated(self, seq: Sequence):
         if seq.seq_id in self.request_blocks:
-            self.free(seq)```
+            self.free(seq)
 
 ## babyvllm/layers/attention.py
 ```python
@@ -2937,3 +2937,1177 @@ def test_static_buffers_init():
     assert buf is not None
 ```
 
+## example.py
+```python
+from babyvllm import LLM, SamplingParams
+
+llm = LLM("Qwen/Qwen2-0.5B")
+sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
+prompts = ["Hello, Baby-vLLM."]
+outputs = llm.generate(prompts, sampling_params)
+print(outputs[0].text)
+```
+
+## benchmarks/benchmark_babyvllm.py
+```python
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import torch
+
+from babyvllm.config import SchedulerConfig
+from babyvllm.llm import LLM
+from babyvllm.sequence import SamplingParams
+
+
+def parse_int_list(raw: str) -> list[int]:
+    return [int(x.strip()) for x in raw.split(",") if x.strip()]
+
+
+def percentile(values: list[float], p: float) -> float | None:
+    if not values:
+        return None
+    xs = sorted(values)
+    if len(xs) == 1:
+        return xs[0]
+    k = (len(xs) - 1) * p / 100.0
+    lo = int(k)
+    hi = min(lo + 1, len(xs) - 1)
+    t = k - lo
+    return xs[lo] * (1.0 - t) + xs[hi] * t
+
+
+def prompt_ids(tokenizer, length: int) -> list[int]:
+    filler = tokenizer.encode("The quick brown fox jumps over the lazy dog. ")
+    if not filler:
+        filler = [1]
+    out: list[int] = []
+    while len(out) < length:
+        out.extend(filler)
+    return out[:length]
+
+
+def sync(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
+def run_once(
+    llm: LLM,
+    prompts: list[list[int]],
+    gen_lens: list[int],
+    max_num_seqs: int,
+) -> dict:
+    llm.engine.reset()
+    llm.engine.scheduler.max_num_seqs = max_num_seqs
+    device = llm.model_runner.device
+
+    for ids, n_gen in zip(prompts, gen_lens):
+        llm.engine.add_request(
+            ids,
+            SamplingParams(temperature=0.0, max_tokens=n_gen, ignore_eos=True),
+        )
+
+    ttft: dict[int, float] = {}
+    last_token_t: dict[int, float] = {}
+    itls: list[float] = []
+    generated = 0
+    steps = 0
+
+    sync(device)
+    t_submit = time.perf_counter()
+    while llm.engine.has_unfinished_requests():
+        sync(device)
+        outputs = llm.engine.step()
+        sync(device)
+        t_after = time.perf_counter()
+        steps += 1
+        for out in outputs:
+            n = len(out.new_token_ids)
+            if not n:
+                continue
+            generated += n
+            if out.seq_id not in ttft:
+                ttft[out.seq_id] = t_after - t_submit
+            if out.seq_id in last_token_t:
+                itls.append(t_after - last_token_t[out.seq_id])
+            last_token_t[out.seq_id] = t_after
+
+    elapsed = time.perf_counter() - t_submit
+    ttfts = list(ttft.values())
+    return {
+        "max_num_seqs": max_num_seqs,
+        "requests": len(prompts),
+        "steps": steps,
+        "gen_tokens": generated,
+        "elapsed_s": elapsed,
+        "tok_s": generated / elapsed if elapsed > 0 else 0.0,
+        "ttft_p50_ms": (percentile(ttfts, 50) or 0.0) * 1e3,
+        "ttft_p99_ms": (percentile(ttfts, 99) or 0.0) * 1e3,
+        "itl_p50_ms": (percentile(itls, 50) or 0.0) * 1e3,
+        "itl_p99_ms": (percentile(itls, 99) or 0.0) * 1e3,
+    }
+
+
+def run_hf(
+    model_name: str,
+    prompts: list[list[int]],
+    gen_lens: list[int],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict:
+    from transformers import AutoModelForCausalLM
+
+    print("\nHuggingFace sequential generate (one request at a time)...", flush=True)
+    hf = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=dtype, low_cpu_mem_usage=True
+    ).to(device).eval()
+
+    generated = 0
+    sync(device)
+    t0 = time.perf_counter()
+    with torch.inference_mode():
+        for i, (ids, n_gen) in enumerate(zip(prompts, gen_lens), 1):
+            inp = torch.tensor([ids], device=device)
+            out = hf.generate(
+                inp,
+                max_new_tokens=n_gen,
+                do_sample=False,
+                use_cache=True,
+            )
+            generated += out.shape[1] - inp.shape[1]
+            print(f"  HF {i}/{len(prompts)}  {time.perf_counter() - t0:.1f}s", flush=True)
+    sync(device)
+    elapsed = time.perf_counter() - t0
+    del hf
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return {
+        "engine": "huggingface_sequential",
+        "gen_tokens": generated,
+        "elapsed_s": elapsed,
+        "tok_s": generated / elapsed if elapsed > 0 else 0.0,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Benchmark baby-vLLM offline throughput")
+    p.add_argument("--model", default="Qwen/Qwen2-0.5B")
+    p.add_argument("--num-requests", type=int, default=32)
+    p.add_argument("--prompt-len", type=int, default=128)
+    p.add_argument("--max-tokens", type=int, default=64)
+    p.add_argument("--seqs", default="1,4,8,16,32", help="max_num_seqs sweep")
+    p.add_argument("--max-batched-tokens", type=int, default=2048)
+    p.add_argument("--mixed", action="store_true", help="ShareGPT-like random lengths")
+    p.add_argument("--vs-hf", action="store_true", help="Also time sequential HuggingFace")
+    p.add_argument("--quick", action="store_true")
+    p.add_argument("--nsys-focus", action="store_true")
+    p.add_argument(
+        "--chrome-trace",
+        default=None,
+        help="Write a Chrome/Perfetto trace of the last sweep point (no nsys needed)",
+    )
+    p.add_argument("--out", default="babyvllm_bench.json")
+    p.add_argument("--seed", type=int, default=0)
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.quick:
+        args.num_requests = 8
+        args.prompt_len = 64
+        args.max_tokens = 16
+        args.seqs = "1,8"
+        args.vs_hf = False
+    if args.nsys_focus:
+        args.num_requests = 4
+        args.prompt_len = 64
+        args.max_tokens = 16
+        args.seqs = "4"
+        args.vs_hf = False
+
+    print(
+        f"Loading baby-vLLM  model={args.model}  "
+        f"requests={args.num_requests} prompt={args.prompt_len} gen={args.max_tokens}",
+        flush=True,
+    )
+    sched = SchedulerConfig(
+        max_num_seqs=max(parse_int_list(args.seqs)),
+        max_num_batched_tokens=args.max_batched_tokens,
+    )
+    llm = LLM(args.model, scheduler_config=sched, verbose=True)
+    device = llm.model_runner.device
+    tokenizer = llm.tokenizer
+    profile = llm.model_runner.kv_profile or {}
+
+    rng = torch.Generator().manual_seed(args.seed)
+    prompts: list[list[int]] = []
+    gen_lens: list[int] = []
+    for _ in range(args.num_requests):
+        if args.mixed:
+            p_len = int(torch.randint(32, args.prompt_len + 1, (1,), generator=rng).item())
+            g_len = int(torch.randint(8, args.max_tokens + 1, (1,), generator=rng).item())
+        else:
+            p_len = args.prompt_len
+            g_len = args.max_tokens
+        prompts.append(prompt_ids(tokenizer, p_len))
+        gen_lens.append(g_len)
+
+    print("\n========== Engine ==========")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"device={device}  dtype={llm.model_runner.dtype}")
+    print(f"KV profile: {json.dumps(profile, indent=2)}")
+    print("============================\n")
+
+    print("Warmup...", flush=True)
+    run_once(llm, prompts[: min(2, len(prompts))], gen_lens[: min(2, len(prompts))], max_num_seqs=1)
+
+    results = []
+    seq_points = parse_int_list(args.seqs)
+    for i, n_seqs in enumerate(seq_points):
+        print(f"\n--- baby-vLLM max_num_seqs={n_seqs} ---", flush=True)
+        use_trace = args.chrome_trace and i == len(seq_points) - 1
+        if use_trace:
+            from torch.profiler import ProfilerActivity, profile
+
+            print(f"Recording Chrome trace -> {args.chrome_trace}", flush=True)
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=False,
+            ) as prof:
+                row = run_once(llm, prompts, gen_lens, max_num_seqs=n_seqs)
+            prof.export_chrome_trace(args.chrome_trace)
+            print(f"Wrote {os.path.abspath(args.chrome_trace)}", flush=True)
+        else:
+            row = run_once(llm, prompts, gen_lens, max_num_seqs=n_seqs)
+        results.append(row)
+        print(
+            f"  {row['tok_s']:.1f} tok/s  "
+            f"{row['gen_tokens']} tokens in {row['elapsed_s']:.2f}s  "
+            f"{row['steps']} steps  "
+            f"TTFT p50/p99 {row['ttft_p50_ms']:.1f}/{row['ttft_p99_ms']:.1f} ms  "
+            f"ITL p50/p99 {row['itl_p50_ms']:.2f}/{row['itl_p99_ms']:.2f} ms",
+            flush=True,
+        )
+
+    hf_row = None
+    if args.vs_hf:
+        hf_row = run_hf(
+            args.model, prompts, gen_lens, device, llm.model_runner.dtype
+        )
+        print(
+            f"-> HF sequential: {hf_row['tok_s']:.2f} tok/s  ({hf_row['elapsed_s']:.1f}s)",
+            flush=True,
+        )
+
+    print("\n========== Results ==========")
+    print(
+        f"{'seqs':>6} {'tok/s':>10} {'TTFT p50':>10} {'TTFT p99':>10} "
+        f"{'ITL p50':>10} {'ITL p99':>10} {'steps':>7}"
+    )
+    for row in results:
+        print(
+            f"{row['max_num_seqs']:6d} {row['tok_s']:10.1f} "
+            f"{row['ttft_p50_ms']:10.1f} {row['ttft_p99_ms']:10.1f} "
+            f"{row['itl_p50_ms']:10.2f} {row['itl_p99_ms']:10.2f} "
+            f"{row['steps']:7d}"
+        )
+    if hf_row:
+        best = max(results, key=lambda r: r["tok_s"])
+        print(
+            f"\nHF sequential: {hf_row['tok_s']:.1f} tok/s  |  "
+            f"baby-vLLM best: {best['tok_s']:.1f} tok/s  "
+            f"({best['tok_s'] / hf_row['tok_s']:.2f}x) at max_num_seqs={best['max_num_seqs']}"
+        )
+
+    payload = {
+        "model": args.model,
+        "device": str(device),
+        "kv_profile": profile,
+        "workload": {
+            "num_requests": args.num_requests,
+            "prompt_len": args.prompt_len,
+            "max_tokens": args.max_tokens,
+            "mixed": args.mixed,
+        },
+        "babyvllm": results,
+        "huggingface_sequential": hf_row,
+    }
+    with open(args.out, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"\nWrote {os.path.abspath(args.out)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+## benchmarks/benchmark_throughput.py
+```python
+import argparse
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from babyvllm.engine import RequestOutput
+from babyvllm.llm import LLM
+from babyvllm.sequence import SamplingParams
+from babyvllm.worker.model_runner import pick_device, pick_dtype
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Throughput: HuggingFace sequential generate vs Baby-vLLM"
+    )
+    parser.add_argument("--model", default="Qwen/Qwen2-0.5B")
+    parser.add_argument("--num-requests", type=int, default=None)
+    parser.add_argument("--prompt-len", type=int, default=None)
+    parser.add_argument("--max-tokens", type=int, default=None)
+    parser.add_argument("--skip-hf", action="store_true")
+    parser.add_argument("--device", default=None, help="cpu, mps, or cuda (default: auto)")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    device = torch.device(args.device) if args.device else pick_device()
+    dtype = pick_dtype(device)
+    on_cuda = device.type == "cuda"
+
+    num_requests = args.num_requests if args.num_requests is not None else (100 if on_cuda else 4)
+    prompt_len = args.prompt_len if args.prompt_len is not None else (64 if on_cuda else 32)
+    max_tokens = args.max_tokens if args.max_tokens is not None else (64 if on_cuda else 16)
+
+    print(f"Device: {device}  dtype: {dtype}", flush=True)
+    print(
+        f"Workload: {num_requests} requests, prompt_len={prompt_len}, max_tokens={max_tokens}",
+        flush=True,
+    )
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    dummy_input = "The quick brown fox jumps over the lazy dog. " * (prompt_len // 8)
+    prompts = [dummy_input] * num_requests
+
+    hf_throughput = None
+    if not args.skip_hf:
+        print("\n[1/2] HuggingFace Transformers (one request at a time)...", flush=True)
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            args.model, dtype=dtype
+        ).to(device).eval()
+
+        start_time = time.time()
+        total_hf_tokens = 0
+        with torch.inference_mode():
+            for i, prompt in enumerate(prompts, 1):
+                ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+                out = hf_model.generate(
+                    ids,
+                    max_new_tokens=max_tokens,
+                    do_sample=False,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+                total_hf_tokens += out.shape[1] - ids.shape[1]
+                print(
+                    f"  HF {i}/{num_requests}  {time.time() - start_time:.1f}s",
+                    flush=True,
+                )
+
+        hf_time = time.time() - start_time
+        hf_throughput = total_hf_tokens / hf_time
+        print(f"-> HF throughput: {hf_throughput:.2f} tok/s  ({hf_time:.1f}s)", flush=True)
+
+        del hf_model
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    else:
+        print("\n[1/2] Skipping HuggingFace baseline (--skip-hf)", flush=True)
+
+    print("\n[2/2] Baby-vLLM (continuous batching)...", flush=True)
+    llm = LLM(args.model, device=device, verbose=True)
+    params = SamplingParams(temperature=0.0, max_tokens=max_tokens, ignore_eos=True)
+    for prompt in prompts:
+        llm.engine.add_request(llm.tokenizer(prompt).input_ids, params)
+
+    print("Running generate loop (first step is prefill)...", flush=True)
+    start_time = time.time()
+    final_outputs: dict[int, RequestOutput] = {}
+    steps = 0
+    while llm.engine.has_unfinished_requests():
+        for out in llm.engine.step():
+            if out.seq_id not in final_outputs:
+                final_outputs[out.seq_id] = RequestOutput(
+                    seq_id=out.seq_id,
+                    new_token_ids=[],
+                    finish_reason=None,
+                )
+            final_outputs[out.seq_id].new_token_ids.extend(out.new_token_ids)
+            if out.finished:
+                final_outputs[out.seq_id].finish_reason = out.finish_reason
+        steps += 1
+        in_flight = len(llm.engine.scheduler.waiting) + len(llm.engine.scheduler.running)
+        print(
+            f"  step {steps}  in-flight={in_flight}  {time.time() - start_time:.1f}s",
+            flush=True,
+        )
+
+    vllm_time = time.time() - start_time
+    total_vllm_tokens = sum(len(o.new_token_ids) for o in final_outputs.values())
+    vllm_throughput = total_vllm_tokens / vllm_time if vllm_time > 0 else 0.0
+    print(
+        f"-> Baby-vLLM throughput: {vllm_throughput:.2f} tok/s  "
+        f"({total_vllm_tokens} tokens, {vllm_time:.1f}s, {steps} steps)",
+        flush=True,
+    )
+
+    print("\n=========================================")
+    if hf_throughput is not None:
+        print(f"HF Transformers:   {hf_throughput:.2f} tok/s")
+        print(f"Baby-vLLM:         {vllm_throughput:.2f} tok/s")
+        print(f"Speedup:           {vllm_throughput / hf_throughput:.2f}x")
+    else:
+        print(f"Baby-vLLM:         {vllm_throughput:.2f} tok/s")
+    print("=========================================")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+## benchmarks/profile_day7.py
+```python
+#!/usr/bin/env python3
+"""Day 7 profiling harness: measure where the 8.21 ms goes.
+
+This script drives baby-vLLM through steady-state decode steps (graphs + Triton)
+and emits NVTX markers so nsys can bucket kernel time.
+
+Usage:
+  1. Timing only (no nsys):
+       python benchmarks/profile_day7.py --model Qwen/Qwen2.5-7B
+
+  2. Full nsys capture with CUDA-graph-node visibility:
+       nsys profile --cuda-graph-trace=node -t cuda,nvtx -o day7_b1_ctx128
+         python benchmarks/profile_day7.py --model Qwen/Qwen2.5-7B
+
+  3. Parse the .sqlite from nsys:
+       python benchmarks/profile_day7.py --parse day7_b1_ctx128.sqlite
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import torch
+
+
+GEMM_PATTERNS = [
+    "gemm", "Gemm", "GEMM",
+    "cutlass", "Cutlass", "CUTLASS",
+    "cublas", "cublasLt", "sm80_xmma", "sm90_xmma",
+    "ampere_", "volta_", "turing_", "hopper_",
+    "void implicit_convolve",
+]
+
+ATTN_PATTERNS = [
+    "paged_decode_attn",
+    "flash_", "Flash", "fmha",
+    "sdpa", "efficient_attention",
+    "sm80_fmha", "sm90_fmha",
+]
+
+FRAMEWORK_PATTERNS = [
+    "Memcpy", "memcpy", "Memset", "memset",
+    "nccl", "NCCL",
+    "cudaLaunchKernel", "cudaGraphLaunch",
+    "cudaStreamSynchronize",
+    "aten::copy_",
+]
+
+
+def classify_kernel(name: str) -> str:
+    for p in ATTN_PATTERNS:
+        if p in name:
+            return "attention"
+    for p in GEMM_PATTERNS:
+        if p in name:
+            return "GEMM"
+    for p in FRAMEWORK_PATTERNS:
+        if p in name:
+            return "framework"
+    return "elementwise"
+
+
+def parse_nsys_sqlite(path: str) -> dict:
+    if not os.path.exists(path):
+        print(f"ERROR: {path} not found.")
+        sys.exit(1)
+
+    conn = sqlite3.connect(path)
+    try:
+        rows = conn.execute("""
+            SELECT shortName AS name, (end - start) AS dur_ns
+            FROM CUPTI_ACTIVITY_KIND_KERNEL ORDER BY start
+        """).fetchall()
+    except sqlite3.OperationalError:
+        try:
+            rows = conn.execute("""
+                SELECT demangledName AS name, (end - start) AS dur_ns
+                FROM CUPTI_ACTIVITY_KIND_KERNEL ORDER BY start
+            """).fetchall()
+        except sqlite3.OperationalError:
+            tables = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+            print(f"Available tables: {[t[0] for t in tables]}")
+            conn.close()
+            sys.exit(1)
+    conn.close()
+
+    if not rows:
+        print("No kernel rows found. Did you use --cuda-graph-trace=node?")
+        sys.exit(1)
+
+    buckets: dict[str, list[float]] = defaultdict(list)
+    for name, dur_ns in rows:
+        cat = classify_kernel(name or "")
+        buckets[cat].append(dur_ns / 1e6)
+
+    total_ms = sum(sum(v) for v in buckets.values())
+
+    print(f"\nDay 7 Kernel Breakdown  ({len(rows)} kernels, {total_ms:.2f} ms total)")
+    for cat in ["GEMM", "elementwise", "attention", "framework"]:
+        times = buckets.get(cat, [])
+        if not times:
+            continue
+        total = sum(times)
+        count = len(times)
+        avg_us = (total / count) * 1000 if count else 0
+        pct = 100.0 * total / total_ms if total_ms else 0
+        print(f"  {cat:<16} {count:>7} kernels  {total:>10.2f} ms  {pct:>5.1f}%  avg {avg_us:.1f} us")
+
+    # Top 20 elementwise kernels
+    ew_by_name: dict[str, list[float]] = defaultdict(list)
+    for name, dur_ns in rows:
+        if classify_kernel(name or "") == "elementwise":
+            short = (name or "unknown").split("<")[0].strip()
+            ew_by_name[short].append(dur_ns / 1e6)
+
+    sorted_ew = sorted(ew_by_name.items(), key=lambda kv: -sum(kv[1]))
+    print("\nTop 20 elementwise kernels:")
+    for name, times in sorted_ew[:20]:
+        total = sum(times)
+        avg_us = (total / len(times)) * 1000
+        print(f"  {name[:50]:<50} {len(times):>6}x  {total:>9.3f} ms  avg {avg_us:.1f} us")
+
+    return {
+        "total_kernels": len(rows),
+        "total_ms": total_ms,
+        "breakdown": {
+            cat: {"count": len(times), "total_ms": sum(times)}
+            for cat, times in buckets.items()
+        },
+    }
+
+
+def run_steady_decode(
+    model_name: str,
+    batch: int,
+    context: int,
+    decode_steps: int,
+    warmup_steps: int,
+) -> dict:
+    from babyvllm.config import SchedulerConfig
+    from babyvllm.llm import LLM
+    from babyvllm.sequence import SamplingParams
+
+    sched = SchedulerConfig(
+        max_num_seqs=max(batch, 256),
+        max_num_batched_tokens=max(batch * context, 8192),
+    )
+
+    print(f"Loading baby-vLLM with {model_name}...", flush=True)
+    llm = LLM(model_name, scheduler_config=sched, verbose=True)
+    device = llm.model_runner.device
+    tokenizer = llm.tokenizer
+
+    filler = tokenizer.encode("The quick brown fox jumps over the lazy dog. ")
+    if not filler:
+        filler = [1]
+
+    prompt_ids = []
+    while len(prompt_ids) < context:
+        prompt_ids.extend(filler)
+    prompt_ids = prompt_ids[:context]
+
+    total_gen = warmup_steps + decode_steps + 5
+    for _ in range(batch):
+        llm.engine.add_request(
+            list(prompt_ids),
+            SamplingParams(temperature=0.0, max_tokens=total_gen, ignore_eos=True),
+        )
+
+    print(f"Prefilling {batch} x {context} tokens...", flush=True)
+
+    prefill_done = False
+    warmup_done = 0
+    while warmup_done < warmup_steps:
+        llm.engine.step()
+        if not prefill_done:
+            prefill_done = True
+            continue
+        warmup_done += 1
+
+    print(f"Warmup done ({warmup_steps} steps). Measuring {decode_steps} decode steps...", flush=True)
+
+    step_times = []
+    torch.cuda.synchronize()
+    torch.cuda.nvtx.range_push(f"MEASURE_B{batch}_CTX{context}")
+
+    for i in range(decode_steps):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        torch.cuda.nvtx.range_push(f"decode_step_{i}")
+        llm.engine.step()
+        torch.cuda.nvtx.range_pop()
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        step_times.append((t1 - t0) * 1e3)
+
+    torch.cuda.nvtx.range_pop()
+
+    step_times.sort()
+    n = len(step_times)
+    p50 = step_times[n // 2]
+    p90 = step_times[int(n * 0.9)]
+    p99 = step_times[int(n * 0.99)]
+    mean = sum(step_times) / n
+
+    result = {
+        "model": model_name,
+        "batch": batch,
+        "context": context,
+        "decode_steps": decode_steps,
+        "warmup_steps": warmup_steps,
+        "cuda_graphs": llm.model_runner.use_cuda_graphs,
+        "step_ms_mean": mean,
+        "step_ms_p50": p50,
+        "step_ms_p90": p90,
+        "step_ms_p99": p99,
+        "step_ms_min": step_times[0],
+        "step_ms_max": step_times[-1],
+        "tok_s": batch / (p50 / 1e3),
+    }
+
+    print(f"\nDecode Step Time -- B={batch}, ctx~{context}")
+    print(f"  mean: {mean:.2f} ms  p50: {p50:.2f} ms  p90: {p90:.2f} ms  p99: {p99:.2f} ms")
+    print(f"  tok/s: {result['tok_s']:.1f}")
+
+    if batch == 1:
+        floor_ms = 4.55
+        print(f"  HBM floor (B=1): {floor_ms} ms  ->  {100 * floor_ms / p50:.0f}% of floor")
+
+    return result
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Day 7: Profile baby-vLLM decode step breakdown")
+    p.add_argument("--model", default="Qwen/Qwen2.5-7B")
+    p.add_argument("--batch", type=int, default=1)
+    p.add_argument("--context", type=int, default=128)
+    p.add_argument("--decode-steps", type=int, default=50)
+    p.add_argument("--warmup-steps", type=int, default=20)
+    p.add_argument("--parse", type=str, default=None)
+    p.add_argument("--out", default="day7_profile.json")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    if args.parse:
+        result = parse_nsys_sqlite(args.parse)
+        with open(args.out, "w") as f:
+            json.dump(result, f, indent=2)
+        print(f"\nWrote {os.path.abspath(args.out)}")
+        return 0
+
+    if not torch.cuda.is_available():
+        print("CUDA required.", file=sys.stderr)
+        return 1
+
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Config: B={args.batch}, ctx={args.context}, "
+          f"measure={args.decode_steps}, warmup={args.warmup_steps}")
+
+    result = run_steady_decode(
+        model_name=args.model,
+        batch=args.batch,
+        context=args.context,
+        decode_steps=args.decode_steps,
+        warmup_steps=args.warmup_steps,
+    )
+
+    with open(args.out, "w") as f:
+        json.dump(result, f, indent=2)
+    print(f"\nWrote {os.path.abspath(args.out)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
+## benchmarks/profile_inference.py
+```python
+#!/usr/bin/env python3
+"""Prefill vs decode anatomy on a single GPU (RTX 3090 / 24GB).
+
+Isolates prefill and decode, sweeps batch size and context length, and reports
+throughput, step time, estimated HBM bandwidth, and a 3090 roofline.
+
+    python benchmarks/profile_inference.py
+    python benchmarks/profile_inference.py --quick
+    python benchmarks/profile_inference.py --nsys-focus
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from dataclasses import asdict, dataclass, field
+
+import torch
+from transformers import AutoModelForCausalLM
+
+
+RTX_3090_FP16_TFLOPS = 71.0
+RTX_3090_HBM_GB_S = 936.0
+RTX_3090_RIDGE_FLOP_PER_BYTE = RTX_3090_FP16_TFLOPS * 1e12 / (RTX_3090_HBM_GB_S * 1e9)
+
+
+@dataclass
+class RunResult:
+    phase: str
+    batch: int
+    context: int
+    decode_tokens: int
+    ok: bool
+    skip_reason: str | None = None
+    latency_ms: float | None = None
+    tok_s: float | None = None
+    tpot_ms: float | None = None
+    peak_mem_gb: float | None = None
+    est_hbm_gb_s: float | None = None
+    est_hbm_pct_peak: float | None = None
+    power_w: float | None = None
+    tokens_per_joule: float | None = None
+
+
+@dataclass
+class SessionInfo:
+    gpu_name: str
+    gpu_memory_gb: float
+    model: str
+    dtype: str
+    attn: str
+    num_params_b: float
+    weight_gb: float
+    n_layers: int
+    n_heads: int
+    n_kv_heads: int
+    head_dim: int
+    hidden_size: int
+    kv_bytes_per_token: int
+    kv_kib_per_token: float
+    max_kv_tokens_est: int
+    ridge_flop_per_byte: float
+    decode_memory_bound_until_batch: int
+    results: list[RunResult] = field(default_factory=list)
+
+
+def parse_int_list(raw: str) -> list[int]:
+    return [int(x.strip()) for x in raw.split(",") if x.strip()]
+
+
+def gpu_power_w() -> float | None:
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+            text=True,
+        )
+        return float(out.strip().splitlines()[0])
+    except Exception:
+        return None
+
+
+def bytes_per_dtype(dtype: torch.dtype) -> int:
+    if dtype in (torch.float16, torch.bfloat16):
+        return 2
+    if dtype == torch.float32:
+        return 4
+    raise ValueError(f"unsupported dtype {dtype}")
+
+
+def count_params(model: torch.nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+
+def kv_bytes_per_token(cfg, dtype: torch.dtype) -> int:
+    head_dim = cfg.hidden_size // cfg.num_attention_heads
+    return (
+        2
+        * cfg.num_hidden_layers
+        * cfg.num_key_value_heads
+        * head_dim
+        * bytes_per_dtype(dtype)
+    )
+
+
+def estimate_decode_bytes(weight_bytes: int, kv_bpt: int, batch: int, context: int) -> int:
+    return weight_bytes + kv_bpt * batch * context
+
+
+def estimate_prefill_flops(num_params: int, batch: int, seq: int) -> float:
+    return 2.0 * num_params * batch * seq
+
+
+def estimate_decode_flops(num_params: int, batch: int) -> float:
+    return 2.0 * num_params * batch
+
+
+@torch.inference_mode()
+def prefill(model, input_ids: torch.Tensor):
+    with torch.cuda.nvtx.range("prefill"):
+        out = model(input_ids=input_ids, use_cache=True)
+    return out.logits, out.past_key_values
+
+
+@torch.inference_mode()
+def decode_n(model, batch, start_len, n_tokens, past, next_ids, device):
+    for t in range(n_tokens):
+        position_ids = torch.full(
+            (batch, 1), start_len + t, device=device, dtype=torch.long
+        )
+        with torch.cuda.nvtx.range("decode"):
+            out = model(
+                input_ids=next_ids,
+                position_ids=position_ids,
+                past_key_values=past,
+                use_cache=True,
+            )
+        past = out.past_key_values
+        next_ids = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    return next_ids
+
+
+def time_cuda(fn) -> float:
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    fn()
+    torch.cuda.synchronize()
+    return time.perf_counter() - t0
+
+
+def load_model(model_name, dtype, attn, device):
+    kwargs = dict(torch_dtype=dtype, low_cpu_mem_usage=True, trust_remote_code=True)
+    try:
+        kwargs["attn_implementation"] = attn
+        model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    except (TypeError, ValueError):
+        kwargs.pop("attn_implementation", None)
+        model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
+    model.to(device)
+    model.eval()
+    return model
+
+
+def run_prefill(model, input_ids, warmup, repeats, num_params):
+    def one():
+        prefill(model, input_ids)
+    for _ in range(warmup):
+        one()
+    torch.cuda.reset_peak_memory_stats()
+    p0 = gpu_power_w()
+    elapsed = time_cuda(lambda: [one() for _ in range(repeats)]) / repeats
+    p1 = gpu_power_w()
+    b, s = input_ids.shape
+    tokens = b * s
+    power = None if p0 is None or p1 is None else 0.5 * (p0 + p1)
+    flops = estimate_prefill_flops(num_params, b, s)
+    return {
+        "latency_ms": elapsed * 1e3,
+        "tok_s": tokens / elapsed,
+        "peak_mem_gb": torch.cuda.max_memory_allocated() / 1e9,
+        "power_w": power,
+        "tokens_per_joule": (tokens / (power * elapsed)) if power and power > 0 else None,
+        "tflops": (flops / elapsed) / 1e12,
+    }
+
+
+def run_decode(model, input_ids, decode_tokens, warmup_tokens, weight_bytes, kv_bpt, num_params, device):
+    batch, ctx = input_ids.shape
+
+    def fresh_cache():
+        logits, past = prefill(model, input_ids)
+        next_ids = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        return past, next_ids
+
+    past, next_ids = fresh_cache()
+    if warmup_tokens:
+        decode_n(model, batch, ctx, warmup_tokens, past, next_ids, device)
+        del past
+        torch.cuda.empty_cache()
+        past, next_ids = fresh_cache()
+
+    def one():
+        decode_n(model, batch, ctx, decode_tokens, past, next_ids, device)
+
+    torch.cuda.reset_peak_memory_stats()
+    p0 = gpu_power_w()
+    elapsed = time_cuda(one)
+    p1 = gpu_power_w()
+    power = None if p0 is None or p1 is None else 0.5 * (p0 + p1)
+    tokens = batch * decode_tokens
+    bytes_moved = estimate_decode_bytes(weight_bytes, kv_bpt, batch, ctx) * decode_tokens
+    hbm_gb_s = (bytes_moved / elapsed) / 1e9
+    return {
+        "latency_ms": elapsed * 1e3,
+        "tok_s": tokens / elapsed,
+        "tpot_ms": (elapsed / decode_tokens) * 1e3,
+        "peak_mem_gb": torch.cuda.max_memory_allocated() / 1e9,
+        "est_hbm_gb_s": hbm_gb_s,
+        "est_hbm_pct_peak": 100.0 * hbm_gb_s / RTX_3090_HBM_GB_S,
+        "power_w": power,
+        "tokens_per_joule": (tokens / (power * elapsed)) if power and power > 0 else None,
+        "tflops": (estimate_decode_flops(num_params, batch) * decode_tokens / elapsed) / 1e12,
+    }
+
+
+def print_roofline(info: SessionInfo) -> None:
+    print("\n========== Roofline (RTX 3090) ==========")
+    print(f"GPU:                 {info.gpu_name}")
+    print(f"Peak FP16 tensor:    {RTX_3090_FP16_TFLOPS:.0f} TFLOP/s")
+    print(f"Peak HBM:            {RTX_3090_HBM_GB_S:.0f} GB/s")
+    print(f"Ridge point:         {info.ridge_flop_per_byte:.0f} FLOP/byte")
+    print(f"Params:              {info.num_params_b:.2f}B  ({info.weight_gb:.2f} GB weights)")
+    print(f"KV bytes/token:      {info.kv_bytes_per_token}  ({info.kv_kib_per_token:.1f} KiB)")
+    print(f"KV capacity est:     {info.max_kv_tokens_est:,} tokens in leftover VRAM")
+    print("==========================================\n")
+
+
+def print_table(results: list[RunResult]) -> None:
+    cols = (
+        f"{'phase':<8} {'B':>3} {'ctx':>5} {'tok/s':>10} {'ms':>9} "
+        f"{'TPOT':>8} {'HBM%':>7} {'memGB':>7} {'W':>6}"
+    )
+    print(cols)
+    print("-" * len(cols))
+    for r in results:
+        if not r.ok:
+            print(f"{r.phase:<8} {r.batch:>3} {r.context:>5} {'SKIP':>10} {r.skip_reason}")
+            continue
+        print(
+            f"{r.phase:<8} {r.batch:>3} {r.context:>5} "
+            f"{r.tok_s:10.1f} {r.latency_ms:9.1f} "
+            f"{(r.tpot_ms or 0):8.2f} {(r.est_hbm_pct_peak or 0):6.1f}% "
+            f"{r.peak_mem_gb:7.2f} {(r.power_w or 0):6.0f}"
+        )
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Prefill/decode profiler for a 24GB GPU")
+    p.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
+    p.add_argument("--dtype", default="bfloat16", choices=("bfloat16", "float16"))
+    p.add_argument("--attn", default="sdpa", help="sdpa | eager | flash_attention_2")
+    p.add_argument("--batches", default="1,4,8,16")
+    p.add_argument("--contexts", default="128,512,1024,2048")
+    p.add_argument("--decode-tokens", type=int, default=64)
+    p.add_argument("--warmup-prefill", type=int, default=2)
+    p.add_argument("--repeats-prefill", type=int, default=5)
+    p.add_argument("--warmup-decode", type=int, default=8)
+    p.add_argument("--quick", action="store_true")
+    p.add_argument("--nsys-focus", action="store_true")
+    p.add_argument("--out", default="profile_results.json")
+    p.add_argument("--fallback-model", default="Qwen/Qwen2.5-0.5B-Instruct")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if not torch.cuda.is_available():
+        print("CUDA is required.", file=sys.stderr)
+        return 1
+
+    if args.quick:
+        args.batches = "1,4"
+        args.contexts = "128,512"
+        args.decode_tokens = 16
+        args.warmup_prefill = 1
+        args.repeats_prefill = 2
+        args.warmup_decode = 4
+    if args.nsys_focus:
+        args.batches = "1"
+        args.contexts = "512"
+        args.decode_tokens = 32
+        args.warmup_prefill = 1
+        args.repeats_prefill = 1
+        args.warmup_decode = 4
+
+    device = torch.device("cuda")
+    dtype = getattr(torch, args.dtype)
+    props = torch.cuda.get_device_properties(0)
+    gpu_name = torch.cuda.get_device_name(0)
+    gpu_gb = props.total_memory / 1e9
+
+    print(f"GPU: {gpu_name}  {gpu_gb:.1f} GB")
+    print(f"Model: {args.model}  dtype={args.dtype}  attn={args.attn}")
+    print("Loading weights...", flush=True)
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    model_name = args.model
+    try:
+        model = load_model(model_name, dtype, args.attn, device)
+    except torch.cuda.OutOfMemoryError:
+        print(f"{model_name} did not fit. Falling back to {args.fallback_model}.", flush=True)
+        torch.cuda.empty_cache()
+        model_name = args.fallback_model
+        model = load_model(model_name, dtype, args.attn, device)
+
+    cfg = model.config
+    num_params = count_params(model)
+    weight_bytes = num_params * bytes_per_dtype(dtype)
+    kv_bpt = kv_bytes_per_token(cfg, dtype)
+    allocated = torch.cuda.memory_allocated()
+    leftover = props.total_memory * 0.90 - allocated
+    max_kv_tokens = max(0, int(leftover / kv_bpt))
+
+    info = SessionInfo(
+        gpu_name=gpu_name,
+        gpu_memory_gb=gpu_gb,
+        model=model_name,
+        dtype=args.dtype,
+        attn=args.attn,
+        num_params_b=num_params / 1e9,
+        weight_gb=weight_bytes / 1e9,
+        n_layers=cfg.num_hidden_layers,
+        n_heads=cfg.num_attention_heads,
+        n_kv_heads=cfg.num_key_value_heads,
+        head_dim=cfg.hidden_size // cfg.num_attention_heads,
+        hidden_size=cfg.hidden_size,
+        kv_bytes_per_token=kv_bpt,
+        kv_kib_per_token=kv_bpt / 1024,
+        max_kv_tokens_est=max_kv_tokens,
+        ridge_flop_per_byte=RTX_3090_RIDGE_FLOP_PER_BYTE,
+        decode_memory_bound_until_batch=max(1, round(RTX_3090_RIDGE_FLOP_PER_BYTE)),
+    )
+    print_roofline(info)
+
+    vocab = min(cfg.vocab_size, 32000)
+    batches = parse_int_list(args.batches)
+    contexts = parse_int_list(args.contexts)
+
+    for ctx in contexts:
+        for batch in batches:
+            print(f"\n--- batch={batch}  context={ctx} ---", flush=True)
+            torch.cuda.empty_cache()
+            try:
+                input_ids = torch.randint(1, vocab, (batch, ctx), device=device)
+
+                with torch.cuda.nvtx.range(f"bench_prefill_b{batch}_c{ctx}"):
+                    pre = run_prefill(model, input_ids,
+                        warmup=args.warmup_prefill, repeats=args.repeats_prefill,
+                        num_params=num_params)
+                info.results.append(RunResult(
+                    phase="prefill", batch=batch, context=ctx, decode_tokens=0, ok=True,
+                    latency_ms=pre["latency_ms"], tok_s=pre["tok_s"],
+                    peak_mem_gb=pre["peak_mem_gb"], power_w=pre["power_w"],
+                    tokens_per_joule=pre["tokens_per_joule"],
+                ))
+                print(
+                    f"  prefill  {pre['tok_s']:.1f} tok/s  {pre['latency_ms']:.1f} ms  "
+                    f"{pre['tflops']:.1f} TFLOP/s  mem {pre['peak_mem_gb']:.2f} GB",
+                    flush=True,
+                )
+
+                with torch.cuda.nvtx.range(f"bench_decode_b{batch}_c{ctx}"):
+                    dec = run_decode(model, input_ids,
+                        decode_tokens=args.decode_tokens, warmup_tokens=args.warmup_decode,
+                        weight_bytes=weight_bytes, kv_bpt=kv_bpt,
+                        num_params=num_params, device=device)
+                info.results.append(RunResult(
+                    phase="decode", batch=batch, context=ctx,
+                    decode_tokens=args.decode_tokens, ok=True,
+                    latency_ms=dec["latency_ms"], tok_s=dec["tok_s"],
+                    tpot_ms=dec["tpot_ms"], peak_mem_gb=dec["peak_mem_gb"],
+                    est_hbm_gb_s=dec["est_hbm_gb_s"],
+                    est_hbm_pct_peak=dec["est_hbm_pct_peak"],
+                    power_w=dec["power_w"], tokens_per_joule=dec["tokens_per_joule"],
+                ))
+                print(
+                    f"  decode   {dec['tok_s']:.1f} tok/s  TPOT {dec['tpot_ms']:.2f} ms  "
+                    f"HBM {dec['est_hbm_pct_peak']:.1f}% of 936 GB/s  "
+                    f"mem {dec['peak_mem_gb']:.2f} GB",
+                    flush=True,
+                )
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                print("  OOM -- skipped", flush=True)
+                info.results.append(RunResult(
+                    phase="both", batch=batch, context=ctx,
+                    decode_tokens=args.decode_tokens, ok=False, skip_reason="oom",
+                ))
+
+    print("\n========== Results ==========")
+    print_table(info.results)
+
+    decode_rows = [r for r in info.results if r.ok and r.phase == "decode"]
+    if decode_rows:
+        best = max(decode_rows, key=lambda r: r.tok_s or 0)
+        low_b = min(decode_rows, key=lambda r: r.batch)
+        print(
+            f"\nHeadline: decode at B={best.batch}, ctx={best.context} "
+            f"reached {best.tok_s:.0f} tok/s "
+            f"({best.est_hbm_pct_peak:.0f}% of 3090 HBM peak)."
+        )
+
+    payload = asdict(info)
+    with open(args.out, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"\nWrote {os.path.abspath(args.out)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```

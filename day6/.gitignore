@@ -1,0 +1,6 @@
+node_modules/
+exports/
+*.mp4
+*.webm
+*.gif
+.DS_Store

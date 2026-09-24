@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from huggingface_hub import hf_hub_download
 
-# Published numbers: this model, bf16, H100. 0.5B is tests/kernel iteration only.
+# his model, bf16, H100. 0.5B is tests/kernel iteration only.
 PUBLISHED_MODEL = "Qwen/Qwen2.5-7B"
 DEV_MODEL = "Qwen/Qwen2.5-0.5B"
 

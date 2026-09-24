@@ -1,0 +1,842 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Day 6 — Don't micromanage your GPU</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap');
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%; overflow: hidden; background: #0b0b0c;
+    font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', monospace;
+  }
+  body { display: flex; align-items: center; justify-content: center; }
+  #stage { position: relative; background: #0b0b0c; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="c"></canvas>
+</div>
+<script>
+const params = new URLSearchParams(location.search);
+const RECORD = params.has('record');
+const POSTER = params.has('poster');
+const RECORD_FPS = 30;
+let scrubT = parseFloat(params.get('t'));
+let recordFrame = 0;
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d', { alpha: false, desynchronized: false });
+
+const W = 1280, H = 720;
+const ACCENT = '#e85d04';
+const GREEN = '#3ecf8e';
+const BLUE = '#4a9eff';
+const AMBER = '#f4c16e';
+const RED = '#ff5d5d';
+const TEXT = 'rgba(255,255,255,0.90)';
+const DIM = 'rgba(255,255,255,0.42)';
+const MUTED = 'rgba(255,255,255,0.14)';
+const PAPER = '#f3efe4';
+
+// Qwen2.5-7B, bf16, H100 SXM, B=64, ctx=1920  (report.md)
+const STEP_CPU = 20.90;
+const STEP_BATCHED = 15.35;
+const STEP_TRITON = 11.86;
+const COPY_GB = 7.0;
+const TRITON_SAVE_MS = 3.5;
+const N_PAPERS = 64;
+
+const DURATION = 56;
+const POSTER_T = 52.6;
+
+const T = {
+  title1: 0.0,
+  problem: 1.9,
+  fix: 14.9,
+  punch1: 23.8,
+  title2: 27.2,
+  gather: 29.2,
+  move: 31.8,
+  triton: 41.6,
+  punch2: 51.3,
+};
+
+const CYCLE = 4.05;
+const N_CYCLES = 3;
+const STAMP_WORK = 0.16;
+
+const Y_HUD = 32;
+const Y_FLOOR = 490;
+const Y_ACTOR = 478;
+const Y_DESK = 468;
+const Y_STACK = 462;
+const Y_CAPTION = 640;
+
+let backingScale = 2;
+let t0 = performance.now();
+let elapsedOffset = 0;
+let paused = POSTER;
+let pauseAt = POSTER_T;
+
+function fitCanvas() {
+  if (RECORD) {
+    canvas.style.width = '3840px';
+    canvas.style.height = '2160px';
+    canvas.width = 3840;
+    canvas.height = 2160;
+    backingScale = 3;
+    ctx.setTransform(backingScale, 0, 0, backingScale, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    return;
+  }
+  const dpr = Math.min(Math.max(window.devicePixelRatio || 1, 2), 3);
+  const fit = Math.min(window.innerWidth / W, window.innerHeight / H);
+  const cssW = W * fit, cssH = H * fit;
+  canvas.style.width = `${cssW}px`;
+  canvas.style.height = `${cssH}px`;
+  canvas.width = Math.round(cssW * dpr);
+  canvas.height = Math.round(cssH * dpr);
+  backingScale = dpr * fit;
+  ctx.setTransform(backingScale, 0, 0, backingScale, 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+}
+fitCanvas();
+window.addEventListener('resize', fitCanvas);
+
+function playhead() {
+  if (paused) return pauseAt;
+  return (((performance.now() - t0) / 1000) + elapsedOffset) % DURATION;
+}
+
+function nowSec() {
+  if (RECORD) return Math.min(recordFrame / RECORD_FPS, DURATION - 0.001);
+  const q = parseFloat(new URLSearchParams(location.search).get('t'));
+  if (!Number.isNaN(q)) return q;
+  if (!Number.isNaN(scrubT)) return scrubT;
+  return playhead();
+}
+
+function togglePause() {
+  if (paused) {
+    t0 = performance.now();
+    elapsedOffset = pauseAt;
+    paused = false;
+  } else {
+    pauseAt = playhead();
+    paused = true;
+  }
+}
+
+function jumpTo(sec) {
+  elapsedOffset = sec;
+  t0 = performance.now();
+  pauseAt = sec;
+  paused = false;
+}
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+function ease(t) { const x = clamp(t, 0, 1); return x * x * (3 - 2 * x); }
+function easeOut(t) { const x = clamp(t, 0, 1); return 1 - (1 - x) * (1 - x); }
+
+function rangeAlpha(t, start, end, fadeIn = 0.5, fadeOut = 0.5) {
+  if (t < start || t > end) return 0;
+  return Math.min(ease(clamp((t - start) / fadeIn, 0, 1)), ease(clamp((end - t) / fadeOut, 0, 1)));
+}
+
+function roundRect(x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+}
+
+function text(str, x, y, size, color, align, weight) {
+  ctx.font = `${weight || 600} ${size}px "JetBrains Mono", monospace`;
+  ctx.fillStyle = color;
+  ctx.textAlign = align || 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(str, x, y);
+}
+
+function tracked(str, x, y, size, color, tracking = 1.6) {
+  ctx.font = `600 ${size}px "JetBrains Mono", monospace`;
+  ctx.fillStyle = color;
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'alphabetic';
+  let cx = x;
+  for (const ch of str) {
+    ctx.fillText(ch, cx, y);
+    cx += ctx.measureText(ch).width + tracking;
+  }
+}
+
+function panel(x, y, w, h, r = 10) {
+  roundRect(x, y, w, h, r);
+  ctx.fillStyle = '#111114';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+}
+
+function shadowEllipse(x, y, rx, ry, a = 0.32) {
+  ctx.fillStyle = `rgba(0,0,0,${a})`;
+  ctx.beginPath();
+  ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function hexToRgb(hex) {
+  const h = hex.replace('#', '');
+  return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+}
+function rgba(hex, a) {
+  const [r, g, b] = hexToRgb(hex);
+  return `rgba(${r},${g},${b},${a})`;
+}
+
+function drawFloor(y) {
+  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+  ctx.beginPath();
+  ctx.moveTo(48, y);
+  ctx.lineTo(1232, y);
+  ctx.stroke();
+  for (let i = 0; i < 11; i++) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+    ctx.beginPath();
+    ctx.moveTo(90 + i * 110, y);
+    ctx.lineTo(lerp(90 + i * 110, 640, 0.1), y + 80);
+    ctx.stroke();
+  }
+}
+
+function drawPaper(x, y, rot, stamped, scale = 1) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(rot);
+  ctx.scale(scale, scale);
+  roundRect(-14, -18, 28, 36, 3);
+  ctx.fillStyle = PAPER;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(40,32,20,0.22)';
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(40,32,20,0.12)';
+  ctx.fillRect(-8, -11, 16, 1.6);
+  ctx.fillRect(-8, -5, 13, 1.6);
+  ctx.fillRect(-8, 1, 15, 1.6);
+  if (stamped) {
+    ctx.strokeStyle = GREEN;
+    ctx.lineWidth = 1.8;
+    roundRect(-7, 4, 14, 11, 2);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-4, 10);
+    ctx.lineTo(-1, 12.5);
+    ctx.lineTo(5.5, 7);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawStack(x, y, n, maxShow = 16) {
+  const show = Math.min(Math.max(0, Math.round(n)), maxShow);
+  if (n <= 0) return;
+  const extra = Math.max(0, n - maxShow) * 0.4;
+  roundRect(x - 18, y - 22 - extra - show * 2.2, 36, extra + show * 2.2 + 24, 3);
+  ctx.fillStyle = '#d9d1c2';
+  ctx.fill();
+  for (let i = 0; i < show; i++) {
+    drawPaper(x + (i % 3) - 1, y - i * 2.25, (i - show / 2) * 0.01, false, 1.05);
+  }
+}
+
+function drawManager(x, y, opts) {
+  const walk = opts.walk || 0;
+  const facing = opts.facing == null ? 1 : opts.facing;
+  const dump = opts.dump || 0;
+  const scale = opts.scale || 1.9;
+  const bob = walk ? Math.abs(Math.sin(walk * Math.PI * 2)) * 3.4 : 0;
+  const gy = y - bob * scale;
+  const swing = walk ? Math.sin(walk * Math.PI * 2) * 10 : 0;
+  const armAng = dump ? -0.95 : (opts.arm || -0.4);
+
+  ctx.save();
+  ctx.translate(x, gy);
+  ctx.scale(scale, scale);
+  shadowEllipse(0, 8, 26, 7, 0.38);
+
+  ctx.fillStyle = '#2a1a12';
+  roundRect(-9 + facing * swing * 0.18, -16, 10, 22, 3); ctx.fill();
+  roundRect(-1 - facing * swing * 0.18, -16, 10, 22, 3); ctx.fill();
+  ctx.fillStyle = '#1c1410';
+  roundRect(-12, -22, 24, 8, 3); ctx.fill();
+
+  roundRect(-19, -66, 38, 46, 11);
+  ctx.fillStyle = '#24160f';
+  ctx.fill();
+  ctx.strokeStyle = rgba(ACCENT, 0.9);
+  ctx.lineWidth = 1.7;
+  ctx.stroke();
+  ctx.fillStyle = ACCENT;
+  roundRect(-19, -66, 38, 9, 4); ctx.fill();
+  text('PY', 0, -40, 12, ACCENT, 'center', 700);
+
+  ctx.beginPath();
+  ctx.arc(0, -80, 15, 0, Math.PI * 2);
+  ctx.fillStyle = '#f0c9a0';
+  ctx.fill();
+  ctx.strokeStyle = rgba(ACCENT, 0.5);
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+  ctx.fillStyle = '#1a120c';
+  ctx.fillRect(-9, -83, 7.5, 2.3);
+  ctx.fillRect(1.5, -83, 7.5, 2.3);
+
+  ctx.strokeStyle = '#f0c9a0';
+  ctx.lineWidth = 4.2;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(facing * 15, -54);
+  ctx.lineTo(facing * (15 + Math.cos(armAng) * 30), -54 + Math.sin(armAng) * 28);
+  ctx.stroke();
+  ctx.restore();
+
+  return {
+    handX: x + scale * facing * (15 + Math.cos(armAng) * 30),
+    handY: gy + scale * (-54 + Math.sin(armAng) * 28),
+  };
+}
+
+function drawRobot(x, y, opts) {
+  const working = opts.working || 0;
+  const idle = opts.idle || 0;
+  const blur = opts.blur || 0;
+  const stamp = opts.stamp || 0;
+  const look = opts.look || 0;
+  const scale = opts.scale || 1.72;
+  const t = opts.t || 0;
+
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(scale, scale);
+  shadowEllipse(0, 10, 36, 8, 0.4);
+
+  if (blur > 0.25) {
+    for (let g = 4; g >= 1; g--) {
+      ctx.save();
+      ctx.globalAlpha = 0.08 * blur;
+      ctx.translate(-g * 9, Math.sin(t * 50 + g) * 2);
+      roundRect(-36, -82, 72, 82, 14);
+      ctx.fillStyle = GREEN;
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  const shake = blur ? Math.sin(t * 70) * 1.6 : 0;
+  ctx.translate(shake, 0);
+
+  roundRect(-36, -82, 72, 82, 14);
+  ctx.fillStyle = idle > 0.5 ? '#16181c' : '#13231c';
+  ctx.fill();
+  ctx.strokeStyle = idle > 0.5 ? MUTED : GREEN;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  roundRect(-26, -70, 52, 18, 5);
+  ctx.fillStyle = idle > 0.5 ? rgba('#6a7380', 0.4) : GREEN;
+  if (working && idle < 0.4) {
+    ctx.shadowColor = GREEN;
+    ctx.shadowBlur = 16;
+  }
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.beginPath();
+  ctx.arc(look * 10, -61, 3.4, 0, Math.PI * 2);
+  ctx.fill();
+
+  text('H100', 0, -38, 14, idle > 0.5 ? DIM : TEXT, 'center', 700);
+
+  const piston = lerp(0, 28, stamp);
+  ctx.fillStyle = '#2a2e33';
+  ctx.fillRect(-6, -10, 12, 20 + piston);
+  roundRect(-18, 8 + piston, 36, 11, 3);
+  ctx.fillStyle = working ? GREEN : '#9aa3ad';
+  ctx.fill();
+
+  if (idle > 0.55) text('…', 0, -94, 24, DIM, 'center', 700);
+  ctx.restore();
+}
+
+function drawDesk(x, y) {
+  roundRect(x - 78, y - 20, 156, 20, 5);
+  ctx.fillStyle = '#1b1c20';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+  ctx.stroke();
+  ctx.fillStyle = '#141518';
+  ctx.fillRect(x - 70, y, 14, 24);
+  ctx.fillRect(x + 56, y, 14, 24);
+}
+
+function drawStepHud(x, y, ms, alpha, color) {
+  if (alpha <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  panel(x, y, 236, 74, 10);
+  tracked('STEP TIME', x + 18, y + 24, 11, DIM, 2);
+  text(`${ms.toFixed(2)} ms`, x + 18, y + 56, 26, color || TEXT, 'left', 700);
+  ctx.restore();
+}
+
+function drawCopyHud(x, y, gb, alpha, color) {
+  if (alpha <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  panel(x, y, 236, 74, 10);
+  tracked('DATA COPIED', x + 18, y + 24, 11, color, 1.5);
+  text(`${gb.toFixed(1)} GB`, x + 18, y + 56, 26, color, 'left', 700);
+  ctx.restore();
+}
+
+function problemCycle(local) {
+  const handoff = 0.9;
+  const stamp0 = 1.05;
+  const stamp1 = stamp0 + STAMP_WORK;
+  let mx, walking, facing, paper, stamped, robotStamp, robotIdle;
+  if (local < handoff) {
+    mx = lerp(300, 760, ease(local / handoff));
+    walking = local / 0.28;
+    facing = 1;
+    paper = 'hand';
+    stamped = false;
+    robotStamp = 0;
+    robotIdle = 0.2;
+  } else if (local < stamp0) {
+    mx = 760; walking = 0; facing = 1; paper = 'desk'; stamped = false;
+    robotStamp = 0; robotIdle = 0;
+  } else if (local < stamp1) {
+    mx = 760; walking = 0; facing = 1; paper = 'desk'; stamped = true;
+    robotStamp = Math.sin(((local - stamp0) / STAMP_WORK) * Math.PI);
+    robotIdle = 0;
+  } else {
+    const u = ease(clamp((local - stamp1) / 1.35, 0, 1));
+    mx = lerp(760, 300, u);
+    walking = u < 1 ? (local - stamp1) / 0.26 : 0;
+    facing = -1;
+    paper = u < 1 ? 'hand' : 'filed';
+    stamped = true;
+    robotStamp = 0;
+    robotIdle = 1;
+  }
+  return { mx, walking, facing, paper, stamped, robotStamp, robotIdle, stamp1 };
+}
+
+function drawPart1(t) {
+  const aProb = rangeAlpha(t, T.problem, T.fix + 0.35, 0.45, 0.4);
+  const aFix = rangeAlpha(t, T.fix, T.title2, 0.45, 0.6);
+  drawFloor(Y_FLOOR);
+  drawDesk(880, Y_DESK);
+
+  if (aProb > 0.02 && t < T.fix + 0.2) {
+    ctx.save();
+    ctx.globalAlpha = aProb;
+    const tp = Math.max(0, t - T.problem);
+    const cycleI = Math.min(N_CYCLES - 1, Math.floor(tp / CYCLE));
+    const local = tp - cycleI * CYCLE;
+    const st = problemCycle(local);
+    const remaining = N_PAPERS - cycleI - 1;
+    drawStack(168, Y_STACK, Math.max(0, remaining));
+    const filed = cycleI + (st.paper === 'filed' ? 1 : 0);
+    if (filed > 0) drawStack(64, Y_STACK, Math.min(filed, 8));
+
+    const hand = drawManager(st.mx, Y_ACTOR, {
+      walk: st.walking, facing: st.facing,
+      arm: st.paper === 'hand' ? -0.55 : 0.45,
+    });
+    drawRobot(1008, Y_ACTOR, {
+      idle: st.robotIdle, working: 1 - st.robotIdle,
+      stamp: st.robotStamp, look: st.robotIdle > 0.5 ? -1 : 0, t,
+    });
+
+    if (st.paper === 'hand') drawPaper(hand.handX + 10, hand.handY + 6, 0.1, st.stamped, 1.15);
+    else if (st.paper === 'desk') drawPaper(872, Y_DESK - 32, -0.05, st.stamped, 1.2);
+
+    let idleMs = 0;
+    for (let i = 0; i < cycleI; i++) idleMs += (CYCLE - 1.2);
+    if (local > st.stamp1) idleMs += (local - st.stamp1);
+    const showIdle = st.robotIdle > 0.6 ? 1 : 0.15;
+    ctx.save();
+    ctx.globalAlpha = showIdle * clamp((tp - 0.7) / 0.5, 0, 1);
+    tracked('IDLE', 560, 168, 14, RED, 4);
+    text(`${(idleMs * 1.85).toFixed(2)} ms`, 640, 244, 68, RED, 'center', 700);
+    text('90% of the GPU is staring at Python', 640, 284, 16, DIM, 'center', 400);
+    ctx.restore();
+
+    drawStepHud(48, Y_HUD, STEP_CPU, 1, ACCENT);
+    text(`${cycleI + 1} / ${N_PAPERS}   one paper at a time`, 640, Y_FLOOR + 42, 14, DIM, 'center', 400);
+    ctx.restore();
+  }
+
+  if (aFix > 0.02) {
+    ctx.save();
+    ctx.globalAlpha = aFix;
+    const tf = t - T.fix;
+    const dumpU = ease(clamp((tf - 0.2) / 1.3, 0, 1));
+    const walkOff = ease(clamp((tf - 1.65) / 0.9, 0, 1));
+    const mx = lerp(300, 780, dumpU) - walkOff * 620;
+    const facing = walkOff > 0.04 ? -1 : 1;
+    const carrying = dumpU < 0.97 && walkOff < 0.04;
+    const hand = drawManager(mx, Y_ACTOR, {
+      walk: (dumpU < 1 && walkOff < 0.02) || (walkOff > 0 && walkOff < 1) ? tf / 0.26 : 0,
+      facing, dump: carrying ? 1 : 0,
+      arm: carrying ? -1.05 : 0.5,
+    });
+
+    const stampStart = 2.05;
+    const stampDur = 5.9;
+    const stampT = clamp((tf - stampStart) / stampDur, 0, 1);
+    const nDone = Math.floor(stampT * N_PAPERS);
+    const stampPhase = ((tf - stampStart) * 14) % 1;
+    const piston = stampT > 0 && stampT < 1
+      ? (stampPhase < 0.32 ? stampPhase / 0.32 : 1 - (stampPhase - 0.32) / 0.68)
+      : 0;
+
+    drawRobot(1008, Y_ACTOR, {
+      idle: 0, working: 1, blur: stampT > 0 && stampT < 1 ? 1 : 0.2,
+      stamp: piston, look: 0, t,
+    });
+
+    if (carrying) drawStack(hand.handX + 6, hand.handY + 12, 18);
+    else {
+      drawStack(872, Y_DESK + 10, Math.min(Math.max(0, N_PAPERS - nDone), 16));
+      if (nDone > 0) drawStack(1148, Y_STACK, Math.min(nDone, 16));
+    }
+
+    if (tf > 1.05 && tf < 1.95) {
+      const burst = (tf - 1.05) / 0.9;
+      for (let i = 0; i < 10; i++) {
+        const u = clamp(burst * 1.35 - i * 0.04, 0, 1);
+        drawPaper(
+          lerp(hand.handX, 872 + (i - 5) * 5, easeOut(u)),
+          lerp(hand.handY, Y_DESK - 32, easeOut(u)) - Math.sin(u * Math.PI) * 86,
+          (1 - u) * 0.5, false, 1.05
+        );
+      }
+    }
+
+    if (stampT > 0.02 && stampT < 1) {
+      tracked('BUSY', 580, 168, 14, GREEN, 4);
+      text(`${nDone} / ${N_PAPERS}`, 640, 244, 68, GREEN, 'center', 700);
+      text('no pause  ·  IDLE vanished', 640, 284, 16, DIM, 'center', 400);
+    } else if (stampT >= 1) {
+      text('IDLE  0.00 ms', 640, 244, 30, GREEN, 'center', 700);
+    } else {
+      text('one stack  ·  64 sequences  ·  walk away', 640, 244, 18, DIM, 'center', 400);
+    }
+
+    const stepMs = lerp(STEP_CPU, STEP_BATCHED, ease(clamp((tf - 5.5) / 1.4, 0, 1)));
+    drawStepHud(48, Y_HUD, stepMs, 1, stepMs < 16.6 ? GREEN : ACCENT);
+    ctx.restore();
+  }
+}
+
+const BOXES = [
+  [0, 0], [2, 0], [4, 0], [6, 0], [8, 0], [9, 0],
+  [1, 1], [3, 1], [5, 1], [7, 1], [9, 1],
+  [0, 2], [2, 2], [4, 2], [6, 2], [8, 2],
+].map(([c, r], i) => ({ c, r, i, color: [AMBER, BLUE, GREEN][i % 3] }));
+
+function shelfBoxPos(b) {
+  return { x: 110 + b.c * 108, y: 148 + b.r * 96 };
+}
+function linePos(i, n) {
+  return { x: 220 + (i / Math.max(1, n - 1)) * 780, y: 530 };
+}
+
+function drawCrate(x, y, color, lit, scale = 1) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(scale, scale);
+  if (lit) { ctx.shadowColor = color; ctx.shadowBlur = 18; }
+  roundRect(-20, -16, 40, 32, 5);
+  ctx.fillStyle = rgba(color, lit ? 0.95 : 0.62);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = rgba('#ffffff', 0.2);
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(255,255,255,0.18)';
+  ctx.beginPath();
+  ctx.moveTo(-20, -6);
+  ctx.lineTo(0, -18);
+  ctx.lineTo(20, -6);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawShelves() {
+  for (let r = 0; r < 3; r++) {
+    const y = 168 + r * 96;
+    roundRect(56, y, 1168, 11, 3);
+    ctx.fillStyle = '#1a1b20';
+    ctx.fill();
+    for (let p = 0; p < 11; p++) {
+      ctx.fillStyle = '#14151a';
+      ctx.fillRect(70 + p * 108, y - 52, 7, 52);
+    }
+  }
+  tracked('GPU MEMORY', 56, 84, 12, DIM, 2.2);
+}
+
+function drawForklift(x, y, carrying, color) {
+  shadowEllipse(x, y + 18, 30, 7, 0.35);
+  roundRect(x - 30, y - 20, 56, 30, 5);
+  ctx.fillStyle = ACCENT;
+  ctx.fill();
+  roundRect(x - 24, y - 34, 24, 16, 3);
+  ctx.fillStyle = '#2a170c';
+  ctx.fill();
+  ctx.fillStyle = '#0e0e10';
+  ctx.beginPath(); ctx.arc(x - 16, y + 14, 7, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x + 16, y + 14, 7, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#c8ccd2';
+  ctx.fillRect(x + 24, y - 8, 28, 4);
+  ctx.fillRect(x + 24, y + 4, 28, 4);
+  if (carrying) drawCrate(x + 46, y - 18, color || AMBER, true, 0.95);
+}
+
+function drawBlockTable(x, y, highlight, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  panel(x, y, 228, 156, 10);
+  tracked('BLOCK TABLE', x + 16, y + 26, 11, AMBER, 1.6);
+  const ids = [3, 17, 8, 42, 11, 29, 4, 51, 16, 7, 33, 20];
+  ids.forEach((id, i) => {
+    const cx = x + 18 + (i % 4) * 50;
+    const cy = y + 46 + Math.floor(i / 4) * 34;
+    const on = highlight === i;
+    roundRect(cx, cy, 42, 26, 4);
+    ctx.fillStyle = on ? rgba(GREEN, 0.9) : 'rgba(255,255,255,0.06)';
+    ctx.fill();
+    text(String(id).padStart(2, '0'), cx + 21, cy + 18, 12, on ? '#04140c' : DIM, 'center', 700);
+  });
+  ctx.restore();
+}
+
+function drawPart2(t) {
+  const moving = t >= T.move && t < T.triton;
+  const gProg = t < T.move ? 0 : t >= T.triton ? 1 : ease(clamp((t - T.move) / (T.triton - T.move - 0.55), 0, 1));
+  drawShelves();
+
+  const n = BOXES.length;
+  const f = gProg * n;
+  const iBox = Math.min(n - 1, Math.floor(f));
+  const local = f - iBox;
+  const picking = moving && gProg > 0 && gProg < 1;
+  const dropPhase = local > 0.55;
+
+  const placed = t >= T.triton ? BOXES.map(() => 'shelf') : BOXES.map((_, i) => {
+    if (i < iBox || (i === iBox && dropPhase && local > 0.82)) return 'line';
+    if (i === iBox && picking) return 'carry';
+    return 'shelf';
+  });
+
+  BOXES.forEach((b, i) => {
+    if (placed[i] === 'shelf') drawCrate(shelfBoxPos(b).x, shelfBoxPos(b).y, b.color, t >= T.triton, t >= T.triton ? 1.05 : 1);
+  });
+
+  if (t < T.triton) {
+    BOXES.forEach((b, i) => {
+      if (placed[i] === 'line') {
+        const p = linePos(i, n);
+        drawCrate(p.x, p.y, b.color, true, 1);
+      }
+    });
+    let fx = 170, fy = 508, carry = null;
+    if (picking) {
+      const src = shelfBoxPos(BOXES[iBox]);
+      const dst = linePos(iBox, n);
+      if (local < 0.45) {
+        const u = ease(local / 0.45);
+        fx = lerp(iBox === 0 ? 150 : linePos(Math.max(0, iBox - 1), n).x, src.x, u);
+        fy = lerp(508, src.y + 40, u);
+      } else if (local < 0.58) {
+        fx = src.x; fy = src.y + 40; carry = BOXES[iBox].color;
+      } else {
+        const u = ease((local - 0.58) / 0.42);
+        fx = lerp(src.x, dst.x, u);
+        fy = lerp(src.y + 40, 508, u);
+        carry = local < 0.92 ? BOXES[iBox].color : null;
+      }
+    } else if (gProg >= 1) {
+      fx = linePos(n - 1, n).x; fy = 508;
+    }
+    drawForklift(fx, fy, !!carry, carry);
+    const copied = gProg * COPY_GB;
+    drawCopyHud(980, Y_HUD, copied, 1, ACCENT);
+    drawStepHud(48, Y_HUD, STEP_BATCHED, 1, TEXT);
+    if (gProg > 0.08) {
+      text(`+${(gProg * TRITON_SAVE_MS).toFixed(1)} ms just rearranging`, 48, Y_HUD + 96, 14, ACCENT, 'left', 400);
+    }
+  }
+
+  if (t >= T.triton) {
+    const tt = t - T.triton;
+    const origin = { x: 640, y: 558 };
+    ctx.beginPath();
+    ctx.arc(origin.x, origin.y, 28, 0, Math.PI * 2);
+    ctx.fillStyle = '#102018';
+    ctx.fill();
+    ctx.strokeStyle = GREEN;
+    ctx.lineWidth = 1.8;
+    ctx.stroke();
+    text('∇', origin.x, origin.y + 8, 22, GREEN, 'center', 700);
+    text('TRITON', origin.x, origin.y + 48, 12, GREEN, 'center', 700);
+
+    let live = -1;
+    BOXES.forEach((b, i) => {
+      const hitAt = 0.5 + i * 0.2;
+      const age = tt - hitAt;
+      if (age >= 0 && age < 1.35) {
+        live = i;
+        const p = shelfBoxPos(b);
+        const u = clamp(age / 0.26, 0, 1);
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.strokeStyle = GREEN;
+        ctx.shadowColor = GREEN;
+        ctx.shadowBlur = 20;
+        ctx.lineWidth = 2.4;
+        ctx.beginPath();
+        ctx.moveTo(origin.x, origin.y - 22);
+        ctx.lineTo(lerp(origin.x, p.x, u), lerp(origin.y - 22, p.y, u));
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 22 * (1 - clamp((age - 0.22) / 1.1, 0, 1)), 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      } else if (age >= 1.35) {
+        const p = shelfBoxPos(b);
+        ctx.save();
+        ctx.globalAlpha = 0.35;
+        ctx.strokeStyle = rgba(GREEN, 0.5);
+        ctx.beginPath();
+        ctx.moveTo(origin.x, origin.y - 22);
+        ctx.lineTo(p.x, p.y);
+        ctx.stroke();
+        ctx.restore();
+      }
+    });
+
+    drawBlockTable(48, 400, live, clamp(tt / 0.4, 0, 1));
+    drawCopyHud(980, Y_HUD, 0, 1, GREEN);
+    const stepMs = lerp(STEP_BATCHED, STEP_TRITON, ease(clamp((tt - 2.5) / 1.7, 0, 1)));
+    drawStepHud(48, Y_HUD, stepMs, 1, stepMs < 13 ? GREEN : TEXT);
+    if (tt > 2.6) text(`−${TRITON_SAVE_MS.toFixed(1)} ms   ·   nothing moved`, 300, Y_HUD + 48, 15, GREEN, 'left', 600);
+  }
+}
+
+function drawPunch(t, start, end, line1, line2) {
+  const a = rangeAlpha(t, start, end, 0.45, 0.55);
+  if (a <= 0) return;
+  const u = clamp((t - start) / 0.9, 0, 1);
+  const scale = u < 0.45 ? lerp(0.88, 1.04, ease(u / 0.45)) : lerp(1.04, 1, ease((u - 0.45) / 0.55));
+  ctx.save();
+  ctx.globalAlpha = a;
+  ctx.fillStyle = 'rgba(11,11,12,0.58)';
+  ctx.fillRect(0, 248, W, 160);
+  ctx.translate(640, 322);
+  ctx.scale(scale, scale);
+  text(line1, 0, 0, 32, '#ffffff', 'center', 700);
+  if (line2) text(line2, 0, 38, 16, DIM, 'center', 400);
+  ctx.restore();
+}
+
+function drawTitleCard(t, start, end, kicker, title, sub) {
+  const a = rangeAlpha(t, start, end, 0.35, 0.45);
+  if (a <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = a;
+  tracked(kicker, 48, 280, 13, ACCENT, 3);
+  text(title, 48, 344, 42, TEXT, 'left', 700);
+  text(sub, 48, 384, 16, DIM, 'left', 400);
+  ctx.restore();
+}
+
+function drawCaptions(t) {
+  const items = [
+    [T.problem + 0.25, T.fix, 'Python hands one job. The GPU finishes in a millisecond.'],
+    [T.fix, T.punch1, 'Drop the whole batch. Then get out of the way.'],
+    [T.gather, T.triton, 'Paged KV is scattered. PyTorch copies 7 GB into a line.'],
+    [T.triton, T.punch2, 'Triton reads the block table and gathers nothing.'],
+  ];
+  items.forEach(([s, e, line]) => {
+    const a = rangeAlpha(t, s, e, 0.35, 0.35);
+    if (a <= 0) return;
+    ctx.save();
+    ctx.globalAlpha = a;
+    panel(48, Y_CAPTION, 1184, 48, 8);
+    ctx.fillStyle = ACCENT;
+    ctx.fillRect(48, Y_CAPTION, 4, 48);
+    text(line, 68, Y_CAPTION + 30, 15, TEXT, 'left', 400);
+    ctx.restore();
+  });
+}
+
+function frame() {
+  ctx.setTransform(backingScale, 0, 0, backingScale, 0, 0);
+  const t = nowSec();
+  ctx.fillStyle = '#0b0b0c';
+  ctx.fillRect(0, 0, W, H);
+
+  drawTitleCard(t, T.title1, T.problem, 'PART 1', 'The micromanager', 'Fixing the CPU delay  ·  64 host syncs + pageable H2D');
+  drawTitleCard(t, T.title2, T.gather, 'PART 2', 'The warehouse', 'Why Triton saved 3.5 ms  ·  gather vs paged reads');
+
+  const a1 = rangeAlpha(t, T.problem - 0.06, T.title2, 0.45, 0.55);
+  const a2 = rangeAlpha(t, T.gather - 0.06, DURATION, 0.45, 0.5);
+  if (a1 > 0.01) { ctx.save(); ctx.globalAlpha = a1; drawPart1(t); ctx.restore(); }
+  if (a2 > 0.01) { ctx.save(); ctx.globalAlpha = a2; drawPart2(t); ctx.restore(); }
+
+  drawPunch(t, T.punch1, T.title2, "Don't micromanage your GPU.", '20.90 ms   →   15.35 ms');
+  drawPunch(t, T.punch2, DURATION, 'Read the data where it lives.', 'Stop moving boxes.   15.35  →  11.86 ms');
+  drawCaptions(t);
+
+  if (!RECORD) requestAnimationFrame(frame);
+}
+
+window.__drawRecordFrame = (i) => {
+  recordFrame = i;
+  frame();
+  return canvas.toDataURL('image/jpeg', 0.92);
+};
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') {
+    e.preventDefault();
+    togglePause();
+  }
+  if (e.key === '1') jumpTo(T.problem);
+  if (e.key === '2') jumpTo(T.gather);
+});
+
+document.fonts.ready.then(() => {
+  t0 = performance.now();
+  elapsedOffset = 0;
+  if (!RECORD) requestAnimationFrame(frame);
+});
+</script>
+</body>
+</html>

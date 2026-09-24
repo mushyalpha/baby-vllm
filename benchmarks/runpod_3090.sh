@@ -1,8 +1,3 @@
-#!/usr/bin/env bash
-# RTX 3090 pod: measure baby-vLLM.
-#   bash benchmarks/runpod_3090.sh          # sweep + HuggingFace sequential baseline
-#   bash benchmarks/runpod_3090.sh quick    # smoke test
-#   bash benchmarks/runpod_3090.sh nsys     # tiny run, wrap with nsys yourself
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
