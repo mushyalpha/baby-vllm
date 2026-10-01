@@ -1,25 +1,6 @@
 #!/usr/bin/env python3
-"""Day 7 profiling harness: measure where the 8.21 ms goes.
-
-This script drives baby-vLLM through steady-state decode steps (graphs + Triton)
-and emits NVTX markers so nsys can bucket kernel time.
-
-Usage:
-  1. Timing only (no nsys):
-       python benchmarks/profile_day7.py --model Qwen/Qwen2.5-7B
-
-  2. Full nsys capture with CUDA-graph-node visibility:
-       nsys profile --cuda-graph-trace=node \
-         -t cuda,nvtx \
-         -o day7_b1_ctx128 \
-         python benchmarks/profile_day7.py --model Qwen/Qwen2.5-7B
-
-  3. Parse the .sqlite from nsys:
-       python benchmarks/profile_day7.py --parse day7_b1_ctx128.sqlite
-"""
 
 from __future__ import annotations
-
 import argparse
 import json
 import os
@@ -29,13 +10,11 @@ import time
 from collections import defaultdict
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
 import torch
 
 
-# ---------------------------------------------------------------------------
-# Kernel classifier
-# ---------------------------------------------------------------------------
+
+# KERNEL CLASSIFIER
 
 GEMM_PATTERNS = [
     "gemm", "Gemm", "GEMM",
@@ -63,9 +42,8 @@ def classify_kernel(name: str) -> str:
     return "elementwise"
 
 
-# ---------------------------------------------------------------------------
-# Parse an nsys .sqlite export
-# ---------------------------------------------------------------------------
+
+# PARSE AN NSYS .SQLITE EXPORT
 
 def parse_nsys_sqlite(path: str) -> dict:
     if not os.path.exists(path):
@@ -74,19 +52,28 @@ def parse_nsys_sqlite(path: str) -> dict:
 
     conn = sqlite3.connect(path)
 
-    # 1. Fetch NVTX decode step windows
+    # Fetch NVTX decode step windows
     windows = []
     try:
         windows = conn.execute("""
-            SELECT n.start, n.end
-            FROM NVTX_EVENTS n
-            JOIN StringIds s ON n.textId = s.id
-            WHERE s.value LIKE 'decode_step_%'
+            SELECT start, end FROM NVTX_EVENTS
+            WHERE text LIKE 'decode_step_%'
         """).fetchall()
     except sqlite3.OperationalError:
-        print("Warning: Could not read NVTX_EVENTS. Schema might differ.")
+        pass
 
-    # 2. Fetch kernels (JOIN with StringIds to get actual names)
+    if not windows:
+        try:
+            windows = conn.execute("""
+                SELECT n.start, n.end
+                FROM NVTX_EVENTS n
+                JOIN StringIds s ON n.textId = s.id
+                WHERE s.value LIKE 'decode_step_%'
+            """).fetchall()
+        except sqlite3.OperationalError:
+            print("Warning: Could not read NVTX_EVENTS.")
+
+    # Fetch kernels
     try:
         rows = conn.execute("""
             SELECT s.value AS name, k.start, k.end
@@ -107,7 +94,7 @@ def parse_nsys_sqlite(path: str) -> dict:
             conn.close()
             sys.exit(1)
 
-    # Fetch Memcpys
+    # Fetch memcpys
     try:
         mcpys = conn.execute("""
             SELECT copyKind, start, end
@@ -119,7 +106,7 @@ def parse_nsys_sqlite(path: str) -> dict:
     except sqlite3.OperationalError:
         pass
 
-    # Fetch Memsets
+    # Fetch memsets
     try:
         msets = conn.execute("""
             SELECT start, end
@@ -136,8 +123,6 @@ def parse_nsys_sqlite(path: str) -> dict:
         print("No kernel rows found. Did you use --cuda-graph-trace=node?")
         sys.exit(1)
 
-    # 3. Filter kernels to only those inside the NVTX measurement windows
-    # and compute idle/gap times
     measured_rows = []
     num_steps = len(windows)
     
@@ -148,21 +133,18 @@ def parse_nsys_sqlite(path: str) -> dict:
     if windows:
         rows.sort(key=lambda x: x[1])
         for w_start, w_end in windows:
-            # find kernels in this window
             w_kernels = [r for r in rows if r[1] >= w_start and r[2] <= w_end]
             if not w_kernels:
                 continue
                 
             w_kernels.sort(key=lambda x: x[1])
             
-            # accumulate measured rows for category breakdown
             for r in w_kernels:
                 measured_rows.append((r[0], r[2] - r[1]))
                 
             pre_launch_ms += (w_kernels[0][1] - w_start) / 1e6
             tail_ms += (w_end - w_kernels[-1][2]) / 1e6
             
-            # calculate gaps between consecutive kernels
             for i in range(1, len(w_kernels)):
                 gap = w_kernels[i][1] - w_kernels[i-1][2]
                 if gap > 0:
@@ -176,11 +158,10 @@ def parse_nsys_sqlite(path: str) -> dict:
         print("Error: NVTX ranges found, but no kernels fell inside them. Check synchronization.")
         sys.exit(1)
 
-    # 4. Bucket and average per step
     buckets: dict[str, list[float]] = defaultdict(list)
     for name, dur_ns in measured_rows:
         cat = classify_kernel(name or "")
-        buckets[cat].append(dur_ns / 1e6)  # ms
+        buckets[cat].append(dur_ns / 1e6)
 
     total_ms = sum(sum(v) for v in buckets.values()) / num_steps
     avg_kernels_per_step = len(measured_rows) / num_steps
@@ -212,9 +193,9 @@ def parse_nsys_sqlite(path: str) -> dict:
     print(f"\n{'='*65}")
     print(f"Idle / CPU Time (Avg per step)")
     print(f"{'='*65}")
-    print(f"pre-launch:    {avg_pre_launch:>6.2f} ms  (CPU scheduling before first kernel)")
-    print(f"in-graph gaps: {avg_in_graph_idle:>6.2f} ms  (idle time between GPU kernels)")
-    print(f"tail:          {avg_tail:>6.2f} ms  (sampling readback, detokenize, Python)")
+    print(f"pre-launch:    {avg_pre_launch:>6.2f} ms")
+    print(f"in-graph gaps: {avg_in_graph_idle:>6.2f} ms")
+    print(f"tail:          {avg_tail:>6.2f} ms")
     print(f"{'-'*65}")
     print(f"WALL TIME:     {wall_ms:>6.2f} ms")
 
@@ -235,6 +216,13 @@ def parse_nsys_sqlite(path: str) -> dict:
         cat_count = len(times) / num_steps
         print(f"{name[:40]:<40} {cat_count:>12.1f} {cat_total:>9.3f}")
 
+    gemm_ms = sum(buckets.get("GEMM", [])) / num_steps if num_steps else 0
+    if gemm_ms > 0:
+        eff_bw = 15.23 / (gemm_ms / 1000)
+        print(f"\n{'='*65}")
+        print(f"Effective GEMM Bandwidth: {eff_bw:.1f} GB/s (assuming 15.23 GB weights)")
+        print(f"{'='*65}")
+
     return {
         "measured_steps": num_steps,
         "avg_kernels_per_step": avg_kernels_per_step,
@@ -252,9 +240,8 @@ def parse_nsys_sqlite(path: str) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Steady-state decode driver
-# ---------------------------------------------------------------------------
+
+# STEADY-STATE DECODE DRIVER
 
 def run_steady_decode(model_name: str, batch: int, context: int, decode_steps: int, warmup_steps: int) -> dict:
     from babyvllm.config import SchedulerConfig
@@ -279,17 +266,14 @@ def run_steady_decode(model_name: str, batch: int, context: int, decode_steps: i
             SamplingParams(temperature=0.0, max_tokens=total_gen, ignore_eos=True),
         )
     
-    # Warmup
-    prefill_done = False
-    warmup_done = 0
-    while warmup_done < warmup_steps:
+    while True:
+        outputs = llm.engine.step()
+        if len(outputs) == batch and all(len(out.new_token_ids) > 0 for out in outputs):
+            break
+            
+    for _ in range(warmup_steps):
         llm.engine.step()
-        if not prefill_done:
-            prefill_done = True
-            continue
-        warmup_done += 1
     
-    # Measurement
     step_times = []
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_push(f"MEASURE_B{batch}_CTX{context}")
@@ -300,8 +284,8 @@ def run_steady_decode(model_name: str, batch: int, context: int, decode_steps: i
         
         torch.cuda.nvtx.range_push(f"decode_step_{i}")
         llm.engine.step()
-        torch.cuda.synchronize()  # Wait for all kernels to finish
-        torch.cuda.nvtx.range_pop() # Now close the window
+        torch.cuda.synchronize()
+        torch.cuda.nvtx.range_pop()
         
         t1 = time.perf_counter()
         step_times.append((t1 - t0) * 1e3)
@@ -322,7 +306,6 @@ def run_steady_decode(model_name: str, batch: int, context: int, decode_steps: i
     print(f"\nDecode Step Time — B={batch}, ctx≈{context} | p50: {p50:.2f} ms")
     return result
 
-
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--model", default="Qwen/Qwen2.5-7B")
@@ -333,7 +316,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--parse", type=str, default=None)
     p.add_argument("--out", default="day7_profile.json")
     return p.parse_args()
-
 
 def main() -> int:
     args = parse_args()

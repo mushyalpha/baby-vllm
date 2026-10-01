@@ -15,3 +15,14 @@ patch_*.py
 .env
 .cursor/
 
+
+# Documentation/Notes
+CODE.md
+report.md
+
+# Profiling outputs
+*.sqlite
+*.nsys-rep
+day7_profile.json
+timing_b1_ctx128.json
+day7/
