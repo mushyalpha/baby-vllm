@@ -7,6 +7,19 @@ MODEL="${1:-Qwen/Qwen2.5-7B}"
 OUTDIR="day7"
 mkdir -p "$OUTDIR"
 
+# Auto-discover nsys if it's missing from the fresh pod PATH
+if ! command -v nsys &> /dev/null; then
+    echo "nsys not in PATH. Searching for it..."
+    NSYS_PATH=$(find /opt/nvidia -name "nsys" -type f -executable 2>/dev/null | head -n 1 || true)
+    if [ -n "$NSYS_PATH" ]; then
+        export PATH=$PATH:$(dirname "$NSYS_PATH")
+        echo "Found nsys and added to PATH: $(dirname "$NSYS_PATH")"
+    else
+        echo "Error: nsys not found. Please install Nsight Systems."
+        exit 1
+    fi
+fi
+
 echo "============================================"
 echo "Day 7 Profiling Session"
 echo "Model: $MODEL"
