@@ -8,9 +8,10 @@ from babyvllm.layers.attention import Attention
 
 try:
     from babyvllm.kernels.activation import fused_silu_mul
-    HAS_TRITON_ACT = True
+    from babyvllm.kernels.rope import fused_rope_and_cache
+    HAS_TRITON = True
 except ImportError:
-    HAS_TRITON_ACT = False
+    HAS_TRITON = False
 
 class Qwen2MLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int):
@@ -22,7 +23,7 @@ class Qwen2MLP(nn.Module):
     def forward(self, x):
         gate_up = self.gate_up_proj(x)
         
-        if gate_up.is_cuda and HAS_TRITON_ACT:
+        if gate_up.is_cuda and HAS_TRITON:
             activated = fused_silu_mul(gate_up)
         else:
             gate, up = gate_up.split(self.intermediate_size, dim=-1)
@@ -52,7 +53,13 @@ class Qwen2Attention(nn.Module):
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         
-        q, k = apply_rope(q, k, cos, sin)
+        if q.is_cuda and HAS_TRITON:
+            # Our custom Triton kernel does RoPE in-place and returns Q, K
+            # It also has the ability to store to KV cache, but we are just testing
+            # the mathematical RoPE parity inside the model first before touching attention.py
+            q, k = fused_rope_and_cache(q, k, v, cos, sin, kv_cache=None, slot_mapping=None)
+        else:
+            q, k = apply_rope(q, k, cos, sin)
         
         o = self.attn(q, k, v)
         return self.o_proj(o.reshape(-1, self.num_heads * self.head_dim))
