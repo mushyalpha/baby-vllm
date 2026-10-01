@@ -6,6 +6,12 @@ from babyvllm.layers.layernorm import RMSNorm
 from babyvllm.layers.rotary import RotaryEmbedding, apply_rope
 from babyvllm.layers.attention import Attention
 
+try:
+    from babyvllm.kernels.activation import fused_silu_mul
+    HAS_TRITON_ACT = True
+except ImportError:
+    HAS_TRITON_ACT = False
+
 class Qwen2MLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
@@ -15,8 +21,14 @@ class Qwen2MLP(nn.Module):
 
     def forward(self, x):
         gate_up = self.gate_up_proj(x)
-        gate, up = gate_up.split(self.intermediate_size, dim=-1)
-        return self.down_proj(F.silu(gate) * up)
+        
+        if gate_up.is_cuda and HAS_TRITON_ACT:
+            activated = fused_silu_mul(gate_up)
+        else:
+            gate, up = gate_up.split(self.intermediate_size, dim=-1)
+            activated = F.silu(gate) * up
+            
+        return self.down_proj(activated)
 
 class Qwen2Attention(nn.Module):
     def __init__(self, cfg, layer_idx):
