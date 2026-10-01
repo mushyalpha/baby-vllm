@@ -4,7 +4,8 @@ import torch.nn.functional as F
 
 from babyvllm.layers.layernorm import RMSNorm
 from babyvllm.layers.rotary import RotaryEmbedding, apply_rope
-from babyvllm.layers.attention import Attention
+from babyvllm.layers.attention import Attention, store_kvcache
+from babyvllm.worker.context import get_forward_context
 
 try:
     from babyvllm.kernels.activation import fused_silu_mul
@@ -53,13 +54,17 @@ class Qwen2Attention(nn.Module):
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
         
+        ctx = get_forward_context()
+        has_cache = self.attn.kv_cache is not None and ctx is not None
+        
         if q.is_cuda and HAS_TRITON:
-            # Our custom Triton kernel does RoPE in-place and returns Q, K
-            # It also has the ability to store to KV cache, but we are just testing
-            # the mathematical RoPE parity inside the model first before touching attention.py
-            q, k = fused_rope_and_cache(q, k, v, cos, sin, kv_cache=None, slot_mapping=None)
+            kv_cache = self.attn.kv_cache if has_cache else None
+            slot_mapping = ctx.attn_metadata.slot_mapping if has_cache else None
+            q, k = fused_rope_and_cache(q, k, v, cos, sin, kv_cache=kv_cache, slot_mapping=slot_mapping)
         else:
             q, k = apply_rope(q, k, cos, sin)
+            if has_cache:
+                store_kvcache(k, v, self.attn.kv_cache, ctx.attn_metadata.slot_mapping)
         
         o = self.attn(q, k, v)
         return self.o_proj(o.reshape(-1, self.num_heads * self.head_dim))

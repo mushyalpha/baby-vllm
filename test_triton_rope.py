@@ -23,7 +23,7 @@ def test_rope_and_cache():
     cos = torch.randn(num_tokens, head_dim, device="cuda", dtype=torch.bfloat16)
     sin = torch.randn(num_tokens, head_dim, device="cuda", dtype=torch.bfloat16)
     
-    slot_mapping = torch.randint(0, num_blocks * block_size, (num_tokens,), device="cuda", dtype=torch.int32)
+    slot_mapping = torch.randint(0, num_blocks * block_size, (num_tokens,), device="cuda", dtype=torch.int64)
     kv_cache = torch.randn(2, num_blocks, block_size, num_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     
     # Reference (PyTorch)
