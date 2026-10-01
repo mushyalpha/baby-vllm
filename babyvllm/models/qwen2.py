@@ -9,12 +9,14 @@ from babyvllm.layers.attention import Attention
 class Qwen2MLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.gate_up_proj = nn.Linear(hidden_size, 2 * intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.intermediate_size = intermediate_size
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        gate_up = self.gate_up_proj(x)
+        gate, up = gate_up.split(self.intermediate_size, dim=-1)
+        return self.down_proj(F.silu(gate) * up)
 
 class Qwen2Attention(nn.Module):
     def __init__(self, cfg, layer_idx):
@@ -24,16 +26,19 @@ class Qwen2Attention(nn.Module):
         self.num_kv_heads = cfg.num_key_value_heads
         self.head_dim = cfg.head_dim
         
-        self.q_proj = nn.Linear(cfg.hidden_size, self.num_heads * self.head_dim, bias=True)
-        self.k_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
-        self.v_proj = nn.Linear(cfg.hidden_size, self.num_kv_heads * self.head_dim, bias=True)
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.qkv_proj = nn.Linear(cfg.hidden_size, self.q_size + 2 * self.kv_size, bias=True)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, cfg.hidden_size, bias=False)
         self.attn = Attention(self.num_heads, self.head_dim, self.num_kv_heads)
 
     def forward(self, x, cos, sin):
-        q = self.q_proj(x).view(-1, self.num_heads, self.head_dim)
-        k = self.k_proj(x).view(-1, self.num_kv_heads, self.head_dim)
-        v = self.v_proj(x).view(-1, self.num_kv_heads, self.head_dim)
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
         
         q, k = apply_rope(q, k, cos, sin)
         
