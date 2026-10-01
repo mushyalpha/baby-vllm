@@ -48,17 +48,20 @@ class Qwen2DecoderLayer(nn.Module):
         self.input_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, eps=cfg.rms_norm_eps)
 
-    def forward(self, x, cos, sin):
-        residual = x
-        x = self.input_layernorm(x)
-        x = self.self_attn(x, cos, sin)
-        x = residual + x
+    def forward(self, hidden_states, residual, cos, sin):
+        # 1. input norm & add
+        normed, residual = self.input_layernorm(hidden_states, residual)
         
-        residual = x
-        x = self.post_attention_layernorm(x)
-        x = self.mlp(x)
-        x = residual + x
-        return x
+        # 2. attention
+        hidden_states = self.self_attn(normed, cos, sin)
+        
+        # 3. post-attn norm & add
+        normed, residual = self.post_attention_layernorm(hidden_states, residual)
+        
+        # 4. mlp
+        hidden_states = self.mlp(normed)
+        
+        return hidden_states, residual
 
 class Qwen2Model(nn.Module):
     def __init__(self, cfg):
@@ -75,12 +78,15 @@ class Qwen2Model(nn.Module):
         )
 
     def forward(self, input_ids, positions):
-        x = self.embed_tokens(input_ids)
-        cos, sin = self.rotary_emb(positions, x.dtype)
+        hidden_states = self.embed_tokens(input_ids)
+        cos, sin = self.rotary_emb(positions, hidden_states.dtype)
+        
+        residual = None
         for layer in self.layers:
-            x = layer(x, cos, sin)
-        x = self.norm(x)
-        return x
+            hidden_states, residual = layer(hidden_states, residual, cos, sin)
+            
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
 
 class Qwen2ForCausalLM(nn.Module):
     def __init__(self, cfg):
