@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 
+import babyvllm.layers.attention as attn_mod
 from babyvllm.layers.attention import Attention, _naive_causal_attention, store_kvcache
 from babyvllm.worker.context import AttentionMetadata, set_forward_context
 
@@ -248,6 +249,83 @@ def test_non_contiguous():
         actual = attn(q_all, k_all, v_all)
         
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+def test_naive_matches_grouped_query_reference():
+    num_heads, num_kv_heads, head_dim, q_len = 4, 2, 16, 8
+    q = torch.randn(q_len, num_heads, head_dim)
+    k = torch.randn(q_len, num_kv_heads, head_dim)
+    v = torch.randn(q_len, num_kv_heads, head_dim)
+    scale = head_dim ** -0.5
+    group = num_heads // num_kv_heads
+    ref = F.scaled_dot_product_attention(
+        q.transpose(0, 1),
+        k.repeat_interleave(group, dim=1).transpose(0, 1),
+        v.repeat_interleave(group, dim=1).transpose(0, 1),
+        is_causal=True,
+        scale=scale,
+    ).transpose(0, 1)
+    got = _naive_causal_attention(q, k, v, scale, group)
+    torch.testing.assert_close(got, ref, atol=1e-5, rtol=1e-5)
+
+
+def test_causal_sdpa_is_4d_and_does_not_expand_kv_heads():
+    num_heads, num_kv_heads, head_dim, q_len = 4, 2, 16, 8
+    q = torch.randn(q_len, num_heads, head_dim)
+    k = torch.randn(q_len, num_kv_heads, head_dim)
+    v = torch.randn(q_len, num_kv_heads, head_dim)
+    seen = {}
+    real = attn_mod.F.scaled_dot_product_attention
+
+    def spy(query, key, value, *args, **kwargs):
+        seen["ndim"] = query.ndim
+        seen["q_shape"] = tuple(query.shape)
+        seen["k_heads"] = key.shape[1]
+        seen["is_causal"] = kwargs.get("is_causal")
+        seen["enable_gqa"] = kwargs.get("enable_gqa")
+        return real(query, key, value, *args, **kwargs)
+
+    attn_mod.F.scaled_dot_product_attention = spy
+    try:
+        _naive_causal_attention(q, k, v, head_dim ** -0.5, num_heads // num_kv_heads)
+    finally:
+        attn_mod.F.scaled_dot_product_attention = real
+
+    assert seen["ndim"] == 4
+    assert seen["q_shape"] == (1, num_heads, q_len, head_dim)
+    assert seen["k_heads"] == num_kv_heads
+    assert seen["is_causal"] is True
+    assert seen["enable_gqa"] is True
+
+
+def test_paged_prefill_matches_naive_when_cache_is_filled():
+    num_heads, num_kv_heads, head_dim, q_len = 4, 2, 16, 10
+    attn = Attention(num_heads, head_dim, num_kv_heads)
+    q = torch.randn(q_len, num_heads, head_dim)
+    k = torch.randn(q_len, num_kv_heads, head_dim)
+    v = torch.randn(q_len, num_kv_heads, head_dim)
+    expected = _naive_causal_attention(q, k, v, attn.scale, attn.num_queries_per_kv)
+
+    block_size = 4
+    num_blocks = (q_len + block_size - 1) // block_size
+    kv_cache = torch.zeros(2, num_blocks, block_size, num_kv_heads, head_dim)
+    attn.kv_cache = kv_cache
+    store_kvcache(k, v, kv_cache, torch.arange(q_len))
+    md = AttentionMetadata(
+        slot_mapping=torch.arange(q_len),
+        block_tables=torch.tensor([[0, 1, 2]], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, q_len], dtype=torch.int32),
+        seq_lens=torch.tensor([q_len], dtype=torch.int32),
+        context_lens=torch.tensor([0], dtype=torch.int32),
+        query_start_loc_cpu=[0, q_len],
+        seq_lens_cpu=[q_len],
+        context_lens_cpu=[0],
+        max_query_len=q_len,
+        max_seq_len=q_len,
+    )
+    with set_forward_context(md):
+        actual = attn(q, k, v)
+    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
 
 if __name__ == "__main__":
     test_prefill_parity()

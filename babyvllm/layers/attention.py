@@ -1,8 +1,19 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from babyvllm.worker.context import get_forward_context
+
+# Flash and the memory-efficient backend both require (batch, heads, seq, dim).
+# MATH is last so a CPU run, or a shape flash cannot take, still completes.
+# A 3D call is (batch, seq, dim) with no head axis, and that dispatch is the
+# math backend, which materialises an fp32 (seq, seq) score matrix.
+_CAUSAL_SDPA_BACKENDS = (
+    SDPBackend.FLASH_ATTENTION,
+    SDPBackend.EFFICIENT_ATTENTION,
+    SDPBackend.MATH,
+)
 
 def store_kvcache(key: torch.Tensor,
                   value: torch.Tensor,
@@ -129,31 +140,56 @@ def _paged_attention_torch(query, kv_cache, md, scale, num_queries_per_kv):
 
         k_i = kv_cache[0][blocks].reshape(-1, num_kv_heads, head_dim)[:seq_len]
         v_i = kv_cache[1][blocks].reshape(-1, num_kv_heads, head_dim)[:seq_len]
-        if num_queries_per_kv > 1:
-            k_i = k_i.repeat_interleave(num_queries_per_kv, dim=1)
-            v_i = v_i.repeat_interleave(num_queries_per_kv, dim=1)
-
-        q_i = query[start:end].transpose(0, 1)
-        k_i = k_i.transpose(0, 1)
-        v_i = v_i.transpose(0, 1)
+        q_i = query[start:end]
 
         if ctx_len == 0 and q_len == seq_len:
-            o = F.scaled_dot_product_attention(q_i, k_i, v_i,
-                                               is_causal=True, scale=scale)
+            # Full prefill. q_len == seq_len, so a causal mask is top-left and
+            # the 4D flash/mem-efficient path is exact.
+            out[start:end] = _causal_sdpa(q_i, k_i, v_i, scale)
         else:
+            # Prefix + a shorter query. is_causal is top-left when the lengths
+            # differ, which hides the cached prefix. The explicit tril keeps
+            # query i attending through key i + ctx_len. A bool mask stays on
+            # the math backend; this branch is one token wide in decode.
+            if num_queries_per_kv > 1:
+                k_i = k_i.repeat_interleave(num_queries_per_kv, dim=1)
+                v_i = v_i.repeat_interleave(num_queries_per_kv, dim=1)
+            q_i = q_i.transpose(0, 1)
+            k_i = k_i.transpose(0, 1)
+            v_i = v_i.transpose(0, 1)
             mask = torch.ones(q_len, seq_len, dtype=torch.bool, device=query.device)
             mask = torch.tril(mask, diagonal=ctx_len)
             o = F.scaled_dot_product_attention(q_i, k_i, v_i,
                                                attn_mask=mask, scale=scale)
-        out[start:end] = o.transpose(0, 1)
+            out[start:end] = o.transpose(0, 1)
     return out
 
 
+def _causal_sdpa(q, k, v, scale):
+    """Causal attention for (seq, heads, dim) Q/K/V.
+
+    4D ``(1, heads, seq, dim)`` is the layout flash and mem-efficient SDPA
+    accept. The previous 3D call was dispatched to the math backend, which
+    writes an fp32 score matrix of shape ``(seq, seq)``: 56.25 GiB at
+    seq = 122_880.
+    """
+    q = q.transpose(0, 1).unsqueeze(0).contiguous()
+    k = k.transpose(0, 1).unsqueeze(0).contiguous()
+    v = v.transpose(0, 1).unsqueeze(0).contiguous()
+    with sdpa_kernel(list(_CAUSAL_SDPA_BACKENDS)):
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=True,
+            scale=scale,
+            enable_gqa=q.shape[1] != k.shape[1],
+        )
+    return out.squeeze(0).transpose(0, 1).contiguous()
+
+
 def _naive_causal_attention(q, k, v, scale, num_queries_per_kv):
-    """Single-sequence, no-cache reference. Only for parity tests."""
-    if num_queries_per_kv > 1:
-        k = k.repeat_interleave(num_queries_per_kv, dim=1)
-        v = v.repeat_interleave(num_queries_per_kv, dim=1)
-    o = F.scaled_dot_product_attention(q.transpose(0, 1), k.transpose(0, 1),
-                                       v.transpose(0, 1), is_causal=True, scale=scale)
-    return o.transpose(0, 1)
+    """Single-sequence, no-cache reference. Also the memory-sizing forward."""
+    if q.shape[1] != k.shape[1] * num_queries_per_kv:
+        raise ValueError(
+            f"query heads {q.shape[1]} != kv heads {k.shape[1]} × {num_queries_per_kv}"
+        )
+    return _causal_sdpa(q, k, v, scale)
