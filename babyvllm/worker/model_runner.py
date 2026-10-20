@@ -11,6 +11,18 @@ from babyvllm.layers.sampler import Sampler
 
 BATCH_BUCKETS = [1, 2, 4, 8, 16, 32, 64]
 CTX_BUCKETS = [256, 2048]
+# Length of the sizing forward. The scheduler budget is a sum over sequences
+# (64 × 1920 = 122_880 at the Day 6 point), not one causal sequence. Running
+# that sum through math SDPA allocates a 122_880² fp32 score matrix, 56.25 GiB,
+# and the LM head on every row is another ~70 GiB. Neither tensor exists in a
+# real step. 128 tokens still crosses the GEMV/GEMM boundary, and a math-backend
+# score matrix at that length is 64 KiB per head.
+MEMORY_PROFILE_TOKENS = 128
+
+
+def profile_forward_tokens(max_batched_tokens: int, max_position_embeddings: int) -> int:
+    """How many tokens the KV-cache sizing forward should run."""
+    return max(1, min(max_batched_tokens, max_position_embeddings, MEMORY_PROFILE_TOKENS))
 
 
 @contextmanager
@@ -143,13 +155,10 @@ class ModelRunner:
         max_batched_tokens = (
             self.scheduler_config.max_num_batched_tokens if self.scheduler_config else 2048
         )
-        dummy_input = torch.zeros(max_batched_tokens, dtype=torch.int64, device=self.device)
-        dummy_positions = torch.arange(max_batched_tokens, dtype=torch.int64, device=self.device)
-
-        with torch.inference_mode():
-            hidden_states = self.model(dummy_input, dummy_positions)
-            _ = self.model.compute_logits(hidden_states)
-            del hidden_states
+        profile_tokens = profile_forward_tokens(
+            max_batched_tokens, self.model_config.max_position_embeddings
+        )
+        self._profile_activation_memory(profile_tokens)
 
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
@@ -186,8 +195,24 @@ class ModelRunner:
             "block_size": self.block_size,
             "num_blocks": num_blocks,
             "max_kv_tokens": num_blocks * self.block_size,
+            "profile_tokens": profile_tokens,
+            "max_num_batched_tokens": max_batched_tokens,
         }
         return num_blocks
+
+    def _profile_activation_memory(self, n_tokens: int) -> None:
+        """Run one short forward so CUDA workspaces exist, then drop it.
+
+        Logits are taken for the last token only, matching prefill and decode.
+        A full-sequence LM head is ``n × vocab`` fp32 and is not part of the
+        memory this pass is measuring.
+        """
+        dummy_input = torch.zeros(n_tokens, dtype=torch.int64, device=self.device)
+        dummy_positions = torch.arange(n_tokens, dtype=torch.int64, device=self.device)
+        with torch.inference_mode():
+            hidden_states = self.model(dummy_input, dummy_positions)
+            _ = self.model.compute_logits(hidden_states[-1:])
+            del hidden_states
 
     def _alloc_kv_tensors(self, num_blocks: int) -> None:
         num_kv_heads = self.model_config.num_key_value_heads
