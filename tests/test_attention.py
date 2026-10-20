@@ -2,7 +2,12 @@ import torch
 import torch.nn.functional as F
 
 import babyvllm.layers.attention as attn_mod
-from babyvllm.layers.attention import Attention, _naive_causal_attention, store_kvcache
+from babyvllm.layers.attention import (
+    Attention,
+    _causal_sdpa,
+    _naive_causal_attention,
+    store_kvcache,
+)
 from babyvllm.worker.context import AttentionMetadata, set_forward_context
 
 def test_prefill_parity():
@@ -286,7 +291,7 @@ def test_causal_sdpa_is_4d_and_does_not_expand_kv_heads():
 
     attn_mod.F.scaled_dot_product_attention = spy
     try:
-        _naive_causal_attention(q, k, v, head_dim ** -0.5, num_heads // num_kv_heads)
+        _causal_sdpa(q, k, v, head_dim ** -0.5)
     finally:
         attn_mod.F.scaled_dot_product_attention = real
 
