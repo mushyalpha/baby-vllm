@@ -20,60 +20,60 @@ if ! command -v nsys &> /dev/null; then
     fi
 fi
 
+# batch:context. Override with SHAPES="1:128" to reproduce the original session.
+# 64:1920 is the Day 6 point whose memory-sizing pass used to OOM.
+# 1:2048 is the longest context the decode graphs capture.
+if [[ -n "${SHAPES:-}" ]]; then
+    read -r -a SHAPE_LIST <<< "$SHAPES"
+else
+    SHAPE_LIST=("1:128" "64:1920" "1:2048")
+fi
+
 echo "============================================"
 echo "Day 7 Profiling Session"
 echo "Model: $MODEL"
 echo "Output: $OUTDIR/"
+echo "Shapes: ${SHAPE_LIST[*]}"
 echo "============================================"
 
-# ──────────────────────────────────────────────
-# Step 1: Timing-only baselines (no nsys overhead)
-# ──────────────────────────────────────────────
-echo ""
-echo "──── Step 1: Timing-only baselines ────"
+for shape in "${SHAPE_LIST[@]}"; do
+    BATCH="${shape%%:*}"
+    CONTEXT="${shape##*:}"
+    TAG="b${BATCH}_ctx${CONTEXT}"
 
-echo "→ B=1, ctx=128 (your 4.55 ms floor comparison)"
-python benchmarks/profile_day7.py \
-    --model "$MODEL" \
-    --batch 1 --context 128 \
-    --decode-steps 100 --warmup-steps 30 \
-    --out "$OUTDIR/timing_b1_ctx128.json"
-
-# ──────────────────────────────────────────────
-# Step 2: nsys capture — B=1, ctx=128
-# ──────────────────────────────────────────────
-echo ""
-echo "──── Step 2: nsys capture B=1, ctx=128 ────"
-echo "(--cuda-graph-trace=node expands graph replay into individual kernels)"
-
-nsys profile \
-    --cuda-graph-trace=node \
-    -t cuda,nvtx \
-    --force-overwrite=true \
-    -o "$OUTDIR/nsys_b1_ctx128" \
+    echo ""
+    echo "──── Timing-only  B=${BATCH} ctx=${CONTEXT} ────"
     python benchmarks/profile_day7.py \
         --model "$MODEL" \
-        --batch 1 --context 128 \
-        --decode-steps 30 --warmup-steps 20 \
-        --out /dev/null
+        --batch "$BATCH" --context "$CONTEXT" \
+        --decode-steps 100 --warmup-steps 30 \
+        --out "$OUTDIR/timing_${TAG}.json"
 
-# ──────────────────────────────────────────────
-# Step 3: Export .sqlite and parse
-# ──────────────────────────────────────────────
-echo ""
-echo "──── Step 3: Export and parse ────"
+    echo ""
+    echo "──── nsys capture  B=${BATCH} ctx=${CONTEXT} ────"
+    nsys profile \
+        --cuda-graph-trace=node \
+        -t cuda,nvtx \
+        --force-overwrite=true \
+        -o "$OUTDIR/nsys_${TAG}" \
+        python benchmarks/profile_day7.py \
+            --model "$MODEL" \
+            --batch "$BATCH" --context "$CONTEXT" \
+            --decode-steps 30 --warmup-steps 20 \
+            --out /dev/null
 
-echo "→ Exporting B=1 .nsys-rep → .sqlite"
-nsys export -t sqlite \
-    --force-overwrite=true \
-    -o "$OUTDIR/nsys_b1_ctx128.sqlite" \
-    "$OUTDIR/nsys_b1_ctx128.nsys-rep"
+    echo "→ Exporting nsys_${TAG}.nsys-rep → .sqlite"
+    nsys export -t sqlite \
+        --force-overwrite=true \
+        -o "$OUTDIR/nsys_${TAG}.sqlite" \
+        "$OUTDIR/nsys_${TAG}.nsys-rep"
 
-echo ""
-echo "========== B=1, ctx=128 KERNEL BREAKDOWN =========="
-python benchmarks/profile_day7.py \
-    --parse "$OUTDIR/nsys_b1_ctx128.sqlite" \
-    --out "$OUTDIR/breakdown_b1_ctx128.json"
+    echo ""
+    echo "========== B=${BATCH}, ctx=${CONTEXT} KERNEL BREAKDOWN =========="
+    python benchmarks/profile_day7.py \
+        --parse "$OUTDIR/nsys_${TAG}.sqlite" \
+        --out "$OUTDIR/breakdown_${TAG}.json"
+done
 
 echo ""
 echo "============================================"
