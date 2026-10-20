@@ -70,7 +70,8 @@ class LLM:
                 f"{profile['total_memory_gb']:.2f} GB, "
                 f"{profile['available_for_kv_gb']:.2f} GB free for cache → "
                 f"{num_blocks} blocks "
-                f"({profile['max_kv_tokens']} tokens)"
+                f"({profile['max_kv_tokens']} tokens), "
+                f"sizing forward {profile.get('profile_tokens', '?')} tokens"
             )
         else:
             self._log(f"KV cache: {num_blocks} blocks (CPU/MPS fallback)")

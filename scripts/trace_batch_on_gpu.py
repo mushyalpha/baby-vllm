@@ -2,7 +2,7 @@
 """Run Qwen2.5-7B through baby-vLLM and write down what the engine actually did.
 
 This script does not invent token ids, block ids, or addresses. It loads the
-model on the CUDA device it finds, steps the real scheduler, and records the
+model on the CUDA device it finds, steps the real scheduler and records the
 block table, free list, slot mapping, sampled token ids, and the layer-0 KV
 pointers those slots map to.
 

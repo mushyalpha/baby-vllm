@@ -250,6 +250,9 @@ def run_steady_decode(model_name: str, batch: int, context: int, decode_steps: i
 
     sched = SchedulerConfig(
         max_num_seqs=max(batch, 256),
+        # Sum of tokens the scheduler may run in one step, not one sequence
+        # length. ModelRunner sizes the KV cache with a short forward; using
+        # batch * context here used to push 122_880 tokens through math SDPA.
         max_num_batched_tokens=max(batch * context, 8192),
     )
     
