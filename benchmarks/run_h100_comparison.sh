@@ -53,7 +53,7 @@ BATCHES="${2:-1,8,32,64}"
 PROMPT_LEN="${3:-128}"
 MAX_TOKENS="${4:-64}"
 
-echo "Model: $MODEL | Batches: $BATCHES | Prompt: $PROMPT_LEN | Max tokens: $MAX_TOKENS"
+echo "Model: $MODEL | Batches: $BATCHES | Prompt: $PROMPT_LEN | Max tokens: $MAX_TOKENS | Repeats: 3"
 echo "Published numbers from this run require an H100 and Qwen2.5-7B bf16."
 
 python benchmarks/benchmark_vs_vllm.py \
@@ -61,5 +61,6 @@ python benchmarks/benchmark_vs_vllm.py \
   --batches "$BATCHES" \
   --prompt-len "$PROMPT_LEN" \
   --max-tokens "$MAX_TOKENS" \
+  --repeats 3 \
   --dtype bfloat16 \
-  --out h100_vllm_comparison.json
+  --out h100_vllm_comparison_r3.json

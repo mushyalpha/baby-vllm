@@ -72,9 +72,9 @@ def test_vllm_kwargs_keep_prefix_caching_off_when_init_forwards_kwargs():
     )
     assert kwargs["enable_prefix_caching"] is False
     assert kwargs["enforce_eager"] is False
-    assert kwargs["enable_chunked_prefill"] is False
+    assert "enable_chunked_prefill" not in kwargs
     assert kwargs["gpu_memory_utilization"] == 0.9
-    assert kwargs["max_num_batched_tokens"] > kwargs["max_model_len"]
+    assert kwargs["max_num_batched_tokens"] == 8192
     assert kwargs["max_num_seqs"] == 64
 
 
@@ -90,6 +90,31 @@ def test_vllm_kwargs_refuse_to_drop_prefix_caching():
             batched_tokens=128,
             forwards_kwargs=False,
         )
+
+
+def test_summarize_trials_uses_the_sample_interval():
+    mod = _load()
+    stats = mod.summarize_trials([1.0, 2.0, 3.0])
+    assert stats["n"] == 3
+    assert stats["median"] == 2.0
+    assert stats["std"] == 1.0
+    assert abs(stats["ci95"] - 1.96 / (3 ** 0.5)) < 1e-12
+
+
+def test_summarize_trials_single_run_has_no_interval():
+    mod = _load()
+    stats = mod.summarize_trials([5.5])
+    assert stats["ci95"] == 0.0
+    assert stats["median"] == 5.5
+
+
+def test_compare_token_ids_reports_the_first_mismatch():
+    mod = _load()
+    assert mod.compare_token_ids([[1, 2, 3]], [[1, 2, 3]])["match"]
+    report = mod.compare_token_ids([[1, 2, 3], [4, 5]], [[1, 9, 3], [4, 5]])
+    assert report["match"] is False
+    assert report["mismatched_sequences"] == 1
+    assert report["first_mismatch"] == {"sequence": 0, "position": 1}
 
 
 def test_publishable_is_only_the_h100_7b_bf16_ladder():

@@ -17,6 +17,12 @@ What this script forces, because the defaults would not be a comparison:
   baby-vLLM otherwise captures on the first decode step.
 - Greedy decoding that actually emits max_tokens (HF stops on EOS unless
   min_new_tokens is set; vLLM and baby-vLLM ignore EOS).
+- Three timed trials after one warmup. The reported point is the median.
+  The 95% interval is 1.96 * sample standard deviation / sqrt(n).
+- vLLM chunked prefill left at the engine default. The token budget holds
+  this grid's largest prefill, so the default scheduler does not split it.
+  Forcing the flag off makes vLLM warn that Qwen2 outputs may be wrong.
+- Greedy ids from the first trial, compared with HuggingFace.
 
 TTFT is the wall clock of a warm 1-token generate. Throughput is new tokens
 divided by the wall clock of a warm generate of --max-tokens, prefill included.
@@ -31,6 +37,7 @@ import gc
 import inspect
 import json
 import os
+import statistics
 import sys
 import time
 from typing import Any
@@ -178,6 +185,84 @@ def decode_tok_s(
     return decode_tokens / decode_s
 
 
+def summarize_trials(values: list[float]) -> dict[str, float]:
+    """Median, and a normal 95% interval from the sample standard deviation."""
+    n = len(values)
+    if n == 0:
+        raise ValueError("no trials")
+    median = float(statistics.median(values))
+    mean = float(statistics.fmean(values))
+    if n < 2:
+        std = 0.0
+        ci95 = 0.0
+    else:
+        std = float(statistics.stdev(values))
+        ci95 = 1.96 * std / (n ** 0.5)
+    return {"n": n, "median": median, "mean": mean, "std": std, "ci95": ci95}
+
+
+def compare_token_ids(
+    reference: list[list[int]] | None,
+    other: list[list[int]] | None,
+) -> dict[str, Any]:
+    """Greedy-id check. Position is the first token that differs, 0-based."""
+    if not reference or not other:
+        return {"match": False, "reason": "missing"}
+    if len(reference) != len(other):
+        return {
+            "match": False,
+            "reason": "batch_size",
+            "reference_sequences": len(reference),
+            "other_sequences": len(other),
+        }
+    mismatched = 0
+    first: dict[str, int] | None = None
+    for i, (left, right) in enumerate(zip(reference, other)):
+        left_ids = [int(token) for token in left]
+        right_ids = [int(token) for token in right]
+        if left_ids == right_ids:
+            continue
+        mismatched += 1
+        if first is None:
+            pos = next((k for k, (a, b) in enumerate(zip(left_ids, right_ids)) if a != b), None)
+            if pos is None:
+                pos = min(len(left_ids), len(right_ids))
+            first = {"sequence": i, "position": pos}
+    return {
+        "match": mismatched == 0,
+        "sequences": len(reference),
+        "mismatched_sequences": mismatched,
+        "first_mismatch": first,
+    }
+
+
+def pack_trials(
+    trials: list[dict[str, Any]],
+    greedy_ids: list[list[int]],
+    stable: bool,
+) -> dict[str, Any]:
+    tok = summarize_trials([t["tok_s"] for t in trials])
+    ttft = summarize_trials([t["ttft_ms"] for t in trials])
+    row: dict[str, Any] = {
+        "tok_s": round(tok["median"], 2),
+        "tok_s_ci95": round(tok["ci95"], 2),
+        "ttft_ms": round(ttft["median"], 2),
+        "ttft_ms_ci95": round(ttft["ci95"], 2),
+        "elapsed_s": round(float(statistics.median([t["elapsed_s"] for t in trials])), 4),
+        "total_tokens": trials[0]["total_tokens"],
+        "n": tok["n"],
+        "trials": trials,
+        "greedy_ids": greedy_ids,
+        "greedy_ids_stable": stable,
+    }
+    decode_vals = [t["decode_tok_s"] for t in trials if isinstance(t.get("decode_tok_s"), (int, float))]
+    if len(decode_vals) == len(trials):
+        dec = summarize_trials(decode_vals)
+        row["decode_tok_s"] = round(dec["median"], 2)
+        row["decode_tok_s_ci95"] = round(dec["ci95"], 2)
+    return row
+
+
 def vllm_engine_kwargs(
     parameters: set[str],
     *,
@@ -194,9 +279,11 @@ def vllm_engine_kwargs(
     it to True. A filter that keeps only the explicit signature would drop the
     flag and time a cached prefill. When the constructor does not forward
     unknown names, a missing fairness flag is a hard stop.
+
+    Chunked prefill is not passed. vLLM keeps its default. Forcing it off
+    makes current vLLM warn that Qwen2 outputs may be wrong, and this grid's
+    prefill already fits in ``batched_tokens``.
     """
-    # Chunked prefill off requires the token budget to exceed max_model_len.
-    budget = max(batched_tokens, max_model_len + 1)
     wanted: dict[str, Any] = {
         "model": model,
         "dtype": dtype,
@@ -204,9 +291,8 @@ def vllm_engine_kwargs(
         "gpu_memory_utilization": 0.9,
         "max_model_len": max_model_len,
         "max_num_seqs": max_batch,
-        "max_num_batched_tokens": budget,
+        "max_num_batched_tokens": batched_tokens,
         "enforce_eager": False,
-        "enable_chunked_prefill": False,
         "trust_remote_code": True,
         "tensor_parallel_size": 1,
         "seed": 0,
@@ -300,6 +386,7 @@ def run_benchmark_hf(
     prompt_len: int,
     max_tokens: int,
     tokenizer,
+    repeats: int,
 ) -> dict[int, dict[str, Any]]:
     print("\n" + "=" * 60)
     print(" [1/3] HuggingFace Transformers, one batched generate, SDPA")
@@ -334,9 +421,13 @@ def run_benchmark_hf(
 
     def generate(ids: list[list[int]], n_new: int):
         input_ids = torch.tensor(ids, dtype=torch.long, device=device)
+        # Every row is exactly prompt_len, so the mask is all ones. Without it,
+        # transformers warns that pad and EOS are the same token and may guess.
+        attention_mask = torch.ones_like(input_ids)
         with torch.inference_mode():
             return hf_model.generate(
                 input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=n_new,
                 min_new_tokens=n_new,
                 do_sample=False,
@@ -356,13 +447,24 @@ def run_benchmark_hf(
             prompts = prompt_ids_for(tokenizer, batch_size, prompt_len)
             generate(prompts, 1)
             sync(device)
-
-            _, ttft_s = time_call(device, lambda: generate(prompts, 1))
-            outputs, elapsed = time_call(device, lambda: generate(prompts, max_tokens))
-            new_tokens = int(outputs.shape[1] - prompt_len) * batch_size
-            tok_s = new_tokens / elapsed if elapsed > 0 else 0.0
-            results[batch_size] = _cell(tok_s, ttft_s * 1000.0, elapsed, new_tokens)
-            _warn_token_count("HF", batch_size, new_tokens, batch_size * max_tokens)
+            trials: list[dict[str, Any]] = []
+            first_ids: list[list[int]] | None = None
+            last_ids: list[list[int]] | None = None
+            for trial in range(1, repeats + 1):
+                _, ttft_s = time_call(device, lambda: generate(prompts, 1))
+                outputs, elapsed = time_call(device, lambda: generate(prompts, max_tokens))
+                ids = outputs[:, prompt_len:].detach().cpu().tolist()
+                new_tokens = sum(len(row) for row in ids)
+                tok_s = new_tokens / elapsed if elapsed > 0 else 0.0
+                trial_row = _cell(tok_s, ttft_s * 1000.0, elapsed, new_tokens)
+                trials.append(trial_row)
+                _warn_token_count("HF", batch_size, new_tokens, batch_size * max_tokens)
+                _print_cell(batch_size, trial_row, trial=trial)
+                if first_ids is None:
+                    first_ids = ids
+                last_ids = ids
+            assert first_ids is not None and last_ids is not None
+            results[batch_size] = pack_trials(trials, first_ids, first_ids == last_ids)
             _print_cell(batch_size, results[batch_size])
         except torch.cuda.OutOfMemoryError as exc:
             results[batch_size] = _oom_cell(exc)
@@ -381,9 +483,16 @@ def _warn_token_count(engine: str, batch: int, got: int, expected: int) -> None:
         )
 
 
-def _print_cell(batch: int, row: dict[str, Any]) -> None:
+def _print_cell(batch: int, row: dict[str, Any], trial: int | None = None) -> None:
+    label = f"trial {trial} " if trial is not None else ""
+    tok = f"{row['tok_s']:.2f}"
+    ttft = f"{row['ttft_ms']:.2f}"
+    if "tok_s_ci95" in row:
+        tok += f" ± {row['tok_s_ci95']:.2f}"
+    if "ttft_ms_ci95" in row:
+        ttft += f" ± {row['ttft_ms_ci95']:.2f}"
     print(
-        f"   batch {batch:>2}: {row['tok_s']:>8.2f} tok/s | TTFT {row['ttft_ms']:>8.2f} ms "
+        f"   {label}batch {batch:>2}: {tok:>8} tok/s | TTFT {ttft:>8} ms "
         f"({row['total_tokens']} tokens in {row['elapsed_s']:.2f}s)",
         flush=True,
     )
@@ -395,10 +504,12 @@ def _run_baby_once(llm, prompts: list[list[int]], max_tokens: int, batch_size: i
     llm.engine.reset()
     llm.engine.scheduler.max_num_seqs = batch_size
     params = SamplingParams(temperature=0.0, max_tokens=max_tokens, ignore_eos=True)
+    order: list[int] = []
     for token_ids in prompts:
-        llm.engine.add_request(token_ids, copy.copy(params))
+        order.append(llm.engine.add_request(token_ids, copy.copy(params)))
 
     seen: set[int] = set()
+    by_seq = {seq_id: [] for seq_id in order}
     tokens_at_ttft = 0
     ttft_s = None
     generated = 0
@@ -410,6 +521,7 @@ def _run_baby_once(llm, prompts: list[list[int]], max_tokens: int, batch_size: i
         for out in step_out:
             n = len(out.new_token_ids)
             generated += n
+            by_seq[out.seq_id].extend(out.new_token_ids)
             if n and out.seq_id not in seen:
                 seen.add(out.seq_id)
         if ttft_s is None and len(seen) == batch_size:
@@ -417,7 +529,7 @@ def _run_baby_once(llm, prompts: list[list[int]], max_tokens: int, batch_size: i
             tokens_at_ttft = generated
     sync(device)
     elapsed = time.perf_counter() - start
-    return generated, elapsed, ttft_s, tokens_at_ttft
+    return generated, elapsed, ttft_s, tokens_at_ttft, [by_seq[seq_id] for seq_id in order]
 
 
 def run_benchmark_babyvllm(
@@ -428,6 +540,7 @@ def run_benchmark_babyvllm(
     max_tokens: int,
     tokenizer,
     budget: int,
+    repeats: int,
 ) -> dict[int, dict[str, Any]]:
     print("\n" + "=" * 60)
     print(" [2/3] baby-vLLM")
@@ -469,20 +582,33 @@ def run_benchmark_babyvllm(
         try:
             prompts = prompt_ids_for(tokenizer, batch_size, prompt_len)
             _run_baby_once(llm, prompts, 1, batch_size, device)
-            # Second value is the synced wall clock of the 1-token run.
-            _generated, ttft_s, _in_run, _at = _run_baby_once(llm, prompts, 1, batch_size, device)
-            generated, elapsed, in_run_ttft, tokens_at_ttft = _run_baby_once(
-                llm, prompts, max_tokens, batch_size, device
-            )
-            tok_s = generated / elapsed if elapsed > 0 else 0.0
-            extra: dict[str, Any] = {}
-            if in_run_ttft is not None:
-                extra["ttft_in_run_ms"] = round(in_run_ttft * 1000.0, 2)
-                rate = decode_tok_s(generated, batch_size, elapsed, in_run_ttft, tokens_at_ttft)
-                if rate is not None:
-                    extra["decode_tok_s"] = round(rate, 2)
-            results[batch_size] = _cell(tok_s, ttft_s * 1000.0, elapsed, generated, **extra)
-            _warn_token_count("baby-vLLM", batch_size, generated, batch_size * max_tokens)
+            trials: list[dict[str, Any]] = []
+            first_ids: list[list[int]] | None = None
+            last_ids: list[list[int]] | None = None
+            for trial in range(1, repeats + 1):
+                # Second value is the synced wall clock of the 1-token run.
+                _generated, ttft_s, _in_run, _at, _one_ids = _run_baby_once(
+                    llm, prompts, 1, batch_size, device
+                )
+                generated, elapsed, in_run_ttft, tokens_at_ttft, ids = _run_baby_once(
+                    llm, prompts, max_tokens, batch_size, device
+                )
+                tok_s = generated / elapsed if elapsed > 0 else 0.0
+                extra: dict[str, Any] = {}
+                if in_run_ttft is not None:
+                    extra["ttft_in_run_ms"] = round(in_run_ttft * 1000.0, 2)
+                    rate = decode_tok_s(generated, batch_size, elapsed, in_run_ttft, tokens_at_ttft)
+                    if rate is not None:
+                        extra["decode_tok_s"] = round(rate, 2)
+                trial_row = _cell(tok_s, ttft_s * 1000.0, elapsed, generated, **extra)
+                trials.append(trial_row)
+                _warn_token_count("baby-vLLM", batch_size, generated, batch_size * max_tokens)
+                _print_cell(batch_size, trial_row, trial=trial)
+                if first_ids is None:
+                    first_ids = ids
+                last_ids = ids
+            assert first_ids is not None and last_ids is not None
+            results[batch_size] = pack_trials(trials, first_ids, first_ids == last_ids)
             _print_cell(batch_size, results[batch_size])
         except torch.cuda.OutOfMemoryError as exc:
             results[batch_size] = _oom_cell(exc)
@@ -536,6 +662,10 @@ def _shutdown_vllm(llm) -> None:
             pass
 
 
+def _vllm_ids(outputs) -> list[list[int]]:
+    return [list(out.outputs[0].token_ids) for out in outputs]
+
+
 def run_benchmark_vllm(
     model_name: str,
     dtype_str: str,
@@ -545,6 +675,7 @@ def run_benchmark_vllm(
     max_tokens: int,
     tokenizer,
     budget: int,
+    repeats: int,
 ) -> tuple[dict[int, dict[str, Any]], dict[str, Any]]:
     print("\n" + "=" * 60)
     print(" [3/3] vLLM offline LLM.generate")
@@ -576,34 +707,16 @@ def run_benchmark_vllm(
         "installed": True,
         "kwargs": {key: value for key, value in kwargs.items() if key != "model"},
         "prefix_caching": kwargs.get("enable_prefix_caching"),
-        "chunked_prefill_disabled": kwargs.get("enable_chunked_prefill") is False,
+        "chunked_prefill": "engine default",
         "enforce_eager": kwargs.get("enforce_eager"),
     }
-    if not meta["chunked_prefill_disabled"]:
-        print(
-            "This vLLM build has no enable_chunked_prefill flag. "
-            f"The token budget is {kwargs.get('max_num_batched_tokens', budget)}, "
-            "which covers this prefill in one step when the batch fits.",
-            flush=True,
-        )
+    print(
+        "Chunked prefill is left at vLLM's default. "
+        f"Token budget {kwargs.get('max_num_batched_tokens', budget)} holds this grid's largest prefill.",
+        flush=True,
+    )
     print(f"vLLM settings: {meta['kwargs']}", flush=True)
-    try:
-        llm = VLLM(**kwargs)
-    except TypeError as exc:
-        # Prefix caching stays off. Only the chunked-prefill flag is optional,
-        # and only when vLLM's own error names that flag.
-        if "enable_chunked_prefill" not in kwargs or "enable_chunked_prefill" not in str(exc):
-            raise
-        kwargs.pop("enable_chunked_prefill")
-        meta["chunked_prefill_disabled"] = False
-        meta["kwargs"].pop("enable_chunked_prefill", None)
-        print(
-            "vLLM rejected enable_chunked_prefill. Prefix caching stays off. "
-            f"Token budget {kwargs.get('max_num_batched_tokens')} covers this prefill "
-            "when the batch fits in one step.",
-            flush=True,
-        )
-        llm = VLLM(**kwargs)
+    llm = VLLM(**kwargs)
 
     print("Warming up vLLM...", flush=True)
     warm = prompt_ids_for(tokenizer, 1, min(prompt_len, 32))
@@ -615,29 +728,34 @@ def run_benchmark_vllm(
         print(f"vLLM: batch {batch_size}...", flush=True)
         try:
             prompts = prompt_ids_for(tokenizer, batch_size, prompt_len)
-            _vllm_generate(llm, prompts, _sampling_params(VLLMSamplingParams, 1))
+            one = _sampling_params(VLLMSamplingParams, 1)
+            full = _sampling_params(VLLMSamplingParams, max_tokens)
+            _vllm_generate(llm, prompts, one)
             sync(device)
-
-            ttft_out, ttft_s = time_call(
-                device,
-                lambda: _vllm_generate(llm, prompts, _sampling_params(VLLMSamplingParams, 1)),
-            )
-            outputs, elapsed = time_call(
-                device,
-                lambda: _vllm_generate(llm, prompts, _sampling_params(VLLMSamplingParams, max_tokens)),
-            )
-            new_tokens = _count_vllm_tokens(outputs)
-            one_tokens = _count_vllm_tokens(ttft_out)
-            tok_s = new_tokens / elapsed if elapsed > 0 else 0.0
-            results[batch_size] = _cell(
-                tok_s, ttft_s * 1000.0, elapsed, new_tokens, ttft_tokens=one_tokens
-            )
-            _warn_token_count("vLLM", batch_size, new_tokens, batch_size * max_tokens)
-            if one_tokens != batch_size:
-                print(
-                    f"   warning: vLLM 1-token run returned {one_tokens} tokens, expected {batch_size}",
-                    flush=True,
-                )
+            trials: list[dict[str, Any]] = []
+            first_ids: list[list[int]] | None = None
+            last_ids: list[list[int]] | None = None
+            for trial in range(1, repeats + 1):
+                ttft_out, ttft_s = time_call(device, lambda: _vllm_generate(llm, prompts, one))
+                outputs, elapsed = time_call(device, lambda: _vllm_generate(llm, prompts, full))
+                new_tokens = _count_vllm_tokens(outputs)
+                one_tokens = _count_vllm_tokens(ttft_out)
+                ids = _vllm_ids(outputs)
+                tok_s = new_tokens / elapsed if elapsed > 0 else 0.0
+                trial_row = _cell(tok_s, ttft_s * 1000.0, elapsed, new_tokens, ttft_tokens=one_tokens)
+                trials.append(trial_row)
+                _warn_token_count("vLLM", batch_size, new_tokens, batch_size * max_tokens)
+                if one_tokens != batch_size:
+                    print(
+                        f"   warning: vLLM 1-token run returned {one_tokens} tokens, expected {batch_size}",
+                        flush=True,
+                    )
+                _print_cell(batch_size, trial_row, trial=trial)
+                if first_ids is None:
+                    first_ids = ids
+                last_ids = ids
+            assert first_ids is not None and last_ids is not None
+            results[batch_size] = pack_trials(trials, first_ids, first_ids == last_ids)
             _print_cell(batch_size, results[batch_size])
         except torch.cuda.OutOfMemoryError as exc:
             results[batch_size] = _oom_cell(exc)
@@ -656,6 +774,9 @@ def _fmt(row: dict[str, Any] | None, metric: str) -> str:
     value = row.get(metric)
     if not isinstance(value, (int, float)):
         return "—"
+    ci = row.get(f"{metric}_ci95")
+    if isinstance(ci, (int, float)):
+        return f"{value:.2f} ± {ci:.2f}"
     return f"{value:.2f}"
 
 
@@ -697,12 +818,10 @@ def print_markdown_results(
     baby_decode = [baby_res.get(b, {}).get("decode_tok_s") for b in batch_sizes]
     if any(isinstance(v, (int, float)) for v in baby_decode):
         print("\n### baby-vLLM decode-only tokens / second\n")
-        print("This excludes the prefill step of the same run. It is not the 21 October steady-state grid.")
+        print("Median across the same trials, with the prefill step removed. It is not the 21 October steady-state grid.")
         print(" | ".join(headers))
         print(" | ".join(["---"] * len(headers)))
-        cells = ["baby-vllm"] + [
-            f"{v:.2f}" if isinstance(v, (int, float)) else "—" for v in baby_decode
-        ]
+        cells = ["baby-vllm"] + [_fmt(baby_res.get(b), "decode_tok_s") for b in batch_sizes]
         print(" | ".join(cells))
 
     ratios = []
@@ -714,11 +833,35 @@ def print_markdown_results(
     if ratios:
         print("\nbaby-vLLM throughput relative to vLLM: " + ", ".join(ratios))
 
+    print("\n### Greedy token ids against HuggingFace\n")
+    for batch in batch_sizes:
+        reference = hf_res.get(batch, {}).get("greedy_ids")
+        for name, res in (("baby-vllm", baby_res), (f"vLLM {vllm_version}", vllm_res)):
+            report = compare_token_ids(reference, res.get(batch, {}).get("greedy_ids"))
+            stable = res.get(batch, {}).get("greedy_ids_stable")
+            if report.get("match"):
+                text = f"batch {batch} {name}: match across {report['sequences']} sequences"
+            elif report.get("reason") == "missing":
+                text = f"batch {batch} {name}: not compared"
+            else:
+                where = report.get("first_mismatch")
+                text = (
+                    f"batch {batch} {name}: {report.get('mismatched_sequences', 0)} "
+                    f"of {report.get('sequences', '?')} sequences differ, first at {where}"
+                )
+            if stable is False:
+                text += ". Ids changed across trials"
+            print(text)
+        if hf_res.get(batch, {}).get("greedy_ids_stable") is False:
+            print(f"batch {batch} HF transformers: ids changed across trials")
+
     print("\n" + "-" * 60)
     print(f"GPU: {gpu}")
     print(f"Model: {model_name} ({dtype_str})")
     print(f"Workload: prompt_len={prompt_len}, max_tokens={max_tokens}, greedy, ignore EOS")
     print(f"Prefill budget: {budget} tokens (cap {PREFILL_TOKEN_CAP})")
+    print("Chunked prefill: vLLM default. This budget holds the largest prefill in the grid.")
+    print("Reported point: median. 95% interval: 1.96 * sample std / sqrt(n).")
     print(
         f"Versions: vLLM {vllm_version}, HF transformers {package_version('transformers')}, "
         f"PyTorch {torch.__version__}"
@@ -750,6 +893,7 @@ def parse_args():
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     p.add_argument("--device", default=None, help="cuda, cpu, or mps. Default: cuda if present.")
+    p.add_argument("--repeats", type=int, default=3, help="Timed trials after warmup. The table reports the median.")
     p.add_argument("--skip-hf", action="store_true")
     p.add_argument("--skip-babyvllm", action="store_true")
     p.add_argument("--skip-vllm", action="store_true")
@@ -768,6 +912,8 @@ def main():
         raise SystemExit("--batches must be a comma-separated list of positive integers")
     if args.max_tokens < 1:
         raise SystemExit("--max-tokens must be positive")
+    if args.repeats < 1:
+        raise SystemExit("--repeats must be positive")
 
     device_str = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(device_str)
@@ -789,7 +935,11 @@ def main():
     name = gpu_name()
     vllm_ver = package_version("vllm")
     cmd_str = "python " + " ".join(sys.argv)
-    can_publish = publishable(name, args.model, args.dtype) and device.type == "cuda"
+    can_publish = (
+        publishable(name, args.model, args.dtype)
+        and device.type == "cuda"
+        and args.repeats >= 3
+    )
 
     print("=" * 60)
     print("HF vs baby-vLLM vs vLLM")
@@ -798,6 +948,7 @@ def main():
     print(f"Model:    {args.model} | dtype: {args.dtype}")
     print(f"Batches:  {batch_sizes}")
     print(f"Workload: prompt_len={args.prompt_len}, max_tokens={args.max_tokens}")
+    print(f"Repeats:  {args.repeats} timed trials, median and 95% interval")
     print(f"Budget:   {budget} tokens per step")
     print(f"Versions: vLLM {vllm_ver}, HF {package_version('transformers')}, PyTorch {torch.__version__}")
     if not can_publish:
@@ -820,13 +971,14 @@ def main():
     if not args.skip_hf:
         hf_results = run_benchmark_hf(
             args.model, getattr(torch, args.dtype), device, batch_sizes,
-            args.prompt_len, args.max_tokens, tokenizer,
+            args.prompt_len, args.max_tokens, tokenizer, args.repeats,
         )
 
     baby_results: dict[int, dict[str, Any]] = {}
     if not args.skip_babyvllm:
         baby_results = run_benchmark_babyvllm(
-            args.model, device, batch_sizes, args.prompt_len, args.max_tokens, tokenizer, budget,
+            args.model, device, batch_sizes, args.prompt_len, args.max_tokens,
+            tokenizer, budget, args.repeats,
         )
 
     vllm_results: dict[int, dict[str, Any]] = {}
@@ -834,7 +986,7 @@ def main():
     if not args.skip_vllm:
         vllm_results, vllm_meta = run_benchmark_vllm(
             args.model, args.dtype, device, batch_sizes, args.prompt_len, args.max_tokens,
-            tokenizer, budget,
+            tokenizer, budget, args.repeats,
         )
 
     print_markdown_results(
@@ -852,6 +1004,7 @@ def main():
             "prompt_len": args.prompt_len,
             "max_tokens": args.max_tokens,
             "batches": batch_sizes,
+            "repeats": args.repeats,
             "prefill_budget": budget,
             "publishable": can_publish,
             "vllm_version": vllm_ver,
@@ -860,9 +1013,11 @@ def main():
             "command": cmd_str,
             "vllm": vllm_meta,
             "definition": {
-                "tok_s": "new tokens / wall clock of generate(max_tokens), prefill included",
-                "ttft_ms": "wall clock of a separate warm generate of 1 new token",
-                "decode_tok_s": "baby-vLLM only: tokens after the first per request, same run",
+                "tok_s": "median of new tokens / wall clock of generate(max_tokens), prefill included",
+                "tok_s_ci95": "1.96 * sample std / sqrt(n) across timed trials",
+                "ttft_ms": "median wall clock of a separate warm generate of 1 new token",
+                "decode_tok_s": "baby-vLLM only: median of tokens after the first per request, same run",
+                "greedy_ids": "token ids from trial 1, compared with HuggingFace",
             },
         },
         "hf_transformers": _json_ready(hf_results),
