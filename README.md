@@ -9,7 +9,7 @@ A lightweight vLLM-style inference engine built from scratch.
 ## Key Features
 
 * **Continuous batching**. Mix prefills and decodes in the same step
-* **Lean codebase**. Clean implementation in ~1,400 lines of Python
+* **Lean codebase**. Clean implementation in ~2,200 lines of Python
 * **Paged KV cache**. Block allocation, preemption, recompute when memory is tight
 
 ## Installation
@@ -23,9 +23,7 @@ pip install git+https://github.com/mushyalpha/baby-vllm.git
 To download the model weights manually:
 
 ```bash
-huggingface-cli download --resume-download Qwen/Qwen2-0.5B \
-  --local-dir ~/huggingface/Qwen2-0.5B/ \
-  --local-dir-use-symlinks False
+hf download Qwen/Qwen2.5-0.5B --local-dir ~/huggingface/Qwen2.5-0.5B
 ```
 
 ## Quick Start
@@ -35,7 +33,7 @@ See `example.py` for usage. The API mirrors vLLM's interface:
 ```python
 from babyvllm import LLM, SamplingParams
 
-llm = LLM("Qwen/Qwen2-0.5B")
+llm = LLM("Qwen/Qwen2.5-0.5B")
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
 prompts = ["Hello, Baby-vLLM."]
 outputs = llm.generate(prompts, sampling_params)
