@@ -131,9 +131,14 @@ class Scheduler:
             if self.kv_cache_manager.num_blocks_needed(seq, needed) > self.kv_cache_manager.num_blocks:
                 self._finish(seq, SequenceFinishReason.LENGTH)
                 continue
-            
-            if budget >= needed and self.kv_cache_manager.can_allocate(seq, needed):
-                self.kv_cache_manager.allocate_slots(seq, needed)
+
+            computed_blocks = self.kv_cache_manager.get_computed_blocks(seq)
+            num_cached = len(computed_blocks) * self.kv_cache_manager.block_size
+            needed -= num_cached
+
+            if budget >= needed and self.kv_cache_manager.can_allocate(seq, needed, computed_blocks):
+                self.kv_cache_manager.allocate_slots(seq, needed, computed_blocks)
+                seq.advance_computed(num_cached)
                 self.admit_seq(seq)
                 scheduled_sequences.append(seq)
                 num_scheduled_tokens[seq.seq_id] = needed
