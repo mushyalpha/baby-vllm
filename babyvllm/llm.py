@@ -79,7 +79,8 @@ class LLM:
         self.engine = LLMEngine(
             model_runner=self.model_runner,
             max_num_batched_tokens=sched_cfg.max_num_batched_tokens,
-            max_num_seqs=sched_cfg.max_num_seqs
+            max_num_seqs=sched_cfg.max_num_seqs,
+            enable_prefix_caching=cache_cfg.enable_prefix_caching,
         )
         if self.model_runner.use_cuda_graphs:
             self._log("CUDA graphs enabled for decode")

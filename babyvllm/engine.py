@@ -28,6 +28,7 @@ class LLMEngine:
         model_runner,
         max_num_batched_tokens: int = 8,
         max_num_seqs: int = 4,
+        enable_prefix_caching: bool = False,
     ):
         self.model_runner = model_runner
         self.block_size = model_runner.block_size
@@ -36,6 +37,7 @@ class LLMEngine:
         self.kv_cache_manager = KVCacheManager(
             num_blocks=num_blocks,
             block_size=self.block_size,
+            enable_prefix_caching=enable_prefix_caching,
         )
 
         self.scheduler = Scheduler(

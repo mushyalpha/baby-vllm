@@ -69,6 +69,7 @@ class CacheConfig:
     block_size: int = 16
     num_gpu_blocks: int = 100
     num_cpu_blocks: int = 100
+    enable_prefix_caching: bool = False
 
 
 @dataclass
