@@ -34,6 +34,9 @@ class Sequence:
         self.finish_reason = None
         self._prompt_len = len(token_ids)
         self.num_computed_tokens: int = 0
+        # Chained hash of each full block of token_ids. Append-only, because
+        # token_ids is append-only. Filled lazily by KVCacheManager.
+        self.block_hashes: list[int] = []
 
 
     def __len__(self):
