@@ -1,0 +1,30 @@
+{
+  "measured_steps": 30,
+  "avg_kernels_per_step": 300.0,
+  "active_gpu_kernel_time_ms": 16.9884513,
+  "avg_active_ms_per_step": 16.9884513,
+  "nsys_nvtx_window_ms": 17.69613659999995,
+  "idle_ms_nsys": {
+    "pre_launch": 0.13157253333333335,
+    "in_graph_idle": 0.5124764333332782,
+    "tail": 0.06363633333333334
+  },
+  "breakdown_per_step": {
+    "memory": {
+      "count": 9.0,
+      "ms": 0.003966933333333334
+    },
+    "elementwise": {
+      "count": 263.0,
+      "ms": 15.260333000000001
+    },
+    "attention": {
+      "count": 28.0,
+      "ms": 1.7241513666666668
+    }
+  },
+  "timing_json": "day7/timing_b1_ctx2048.json",
+  "clean_wall_p50_ms": 17.249602829300176,
+  "clean_wall_p50_ci95_ms": 0.008192841016757366,
+  "clean_scheduling_overhead_ms": 0.26115152930017516
+}
