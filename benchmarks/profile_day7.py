@@ -446,10 +446,10 @@ def run_steady_decode(
 
     sched = SchedulerConfig(
         max_num_seqs=max(batch, 256),
-        # Sum of tokens the scheduler may run in one step, not one sequence
-        # length. ModelRunner sizes the KV cache with a short forward; using
-        # batch * context here used to push 122_880 tokens through math SDPA.
-        max_num_batched_tokens=max(batch * context, 8192),
+        # Tokens one step may run. 64 × 1920 = 122_880, and that eager prefill
+        # asks gate_up for an 8.67 GiB activation after the KV cache has taken
+        # the rest of an 80 GB H100. Decode is one token per sequence either way.
+        max_num_batched_tokens=8192,
     )
 
     llm = LLM(model_name, scheduler_config=sched, verbose=True)
