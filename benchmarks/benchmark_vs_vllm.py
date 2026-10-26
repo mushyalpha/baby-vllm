@@ -877,9 +877,14 @@ def print_markdown_results(
         "9024 tok/s at batch 64) are steady-state decode around context 128–258, "
         "from a different harness. Do not put those numbers in this table."
     )
+    if os.environ.get("BABYVLLM_PREFILL_ATTN", "triton") == "torch":
+        prefill = ("baby-vLLM prefill (BABYVLLM_PREFILL_ATTN=torch) gathers each "
+                   "sequence's KV blocks in Python and runs SDPA on that sequence.")
+    else:
+        prefill = ("baby-vLLM prefill runs the Triton varlen paged prefill kernel "
+                   "over the whole batch, reading K/V from the paged cache.")
     print(
-        "baby-vLLM prefill gathers each sequence's KV blocks in Python and runs "
-        "4D SDPA on that sequence. Decode replays a CUDA graph and the Triton "
+        f"{prefill} Decode replays a CUDA graph and the Triton "
         "paged-attention kernel. Each step copies the sampled ids back with "
         "tokens.cpu().tolist() before the next step is scheduled."
     )
@@ -1010,6 +1015,7 @@ def main():
             "vllm_version": vllm_ver,
             "hf_version": package_version("transformers"),
             "pytorch_version": torch.__version__,
+            "babyvllm_prefill_attn": os.environ.get("BABYVLLM_PREFILL_ATTN", "triton"),
             "command": cmd_str,
             "vllm": vllm_meta,
             "definition": {
