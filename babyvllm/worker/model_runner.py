@@ -219,7 +219,9 @@ class ModelRunner:
         head_dim = self.model_config.head_dim
         for module in self.model.modules():
             if isinstance(module, Attention):
-                module.kv_cache = torch.empty(
+                # Zeroed, not empty: the torch decode path reads padded slots past
+                # seq_len, and a NaN there survives the -inf mask in softmax @ V.
+                module.kv_cache = torch.zeros(
                     2,
                     num_blocks,
                     self.block_size,
