@@ -1,9 +1,15 @@
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from babyvllm.worker.context import get_forward_context
+
+# Multi-token CUDA steps: "triton" is the paged prefill kernel, "torch" is the
+# per-sequence SDPA loop below. Kept switchable for A/B runs.
+_PREFILL_BACKEND = os.environ.get("BABYVLLM_PREFILL_ATTN", "triton")
 
 # Flash and the memory-efficient backend both require (batch, heads, seq, dim).
 # MATH is last so a CPU run, or a shape flash cannot take, still completes.
@@ -48,6 +54,9 @@ class Attention(nn.Module):
         if md.max_query_len == 1 and q.is_cuda and self.kv_cache.shape[2] >= 16:
             from babyvllm.kernels.paged_attn import paged_decode_attention
             return paged_decode_attention(q, self.kv_cache, md.block_tables, md.seq_lens, self.scale)
+        if md.max_query_len > 1 and q.is_cuda and _PREFILL_BACKEND == "triton":
+            from babyvllm.kernels.paged_prefill import paged_prefill_attention
+            return paged_prefill_attention(q, self.kv_cache, md, self.scale)
         if md.max_query_len == 1:
             return _static_decode_attention(
                 q, self.kv_cache, md, self.scale,
