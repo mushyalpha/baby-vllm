@@ -10,42 +10,8 @@ from babyvllm.layers.attention import (
 )
 from babyvllm.worker.context import AttentionMetadata, set_forward_context
 
-def test_prefill_parity():
-    num_heads = 4
-    num_kv_heads = 2
-    head_dim = 16
-    q_len = 10
-    
-    attn = Attention(num_heads, head_dim, num_kv_heads)
-    
-    q = torch.randn(q_len, num_heads, head_dim)
-    k = torch.randn(q_len, num_kv_heads, head_dim)
-    v = torch.randn(q_len, num_kv_heads, head_dim)
-    
-    expected = attn(q, k, v)
-    
-    block_size = 4
-    num_blocks = (q_len + block_size - 1) // block_size
-    kv_cache = torch.empty(2, num_blocks, block_size, num_kv_heads, head_dim)
-    attn.kv_cache = kv_cache
-    
-    md = AttentionMetadata(
-        slot_mapping=torch.arange(q_len),
-        block_tables=torch.tensor([[0, 1, 2]], dtype=torch.int32),
-        query_start_loc=torch.tensor([0, q_len], dtype=torch.int32),
-        seq_lens=torch.tensor([q_len], dtype=torch.int32),
-        context_lens=torch.tensor([0], dtype=torch.int32),
-        query_start_loc_cpu=[0, q_len],
-        seq_lens_cpu=[q_len],
-        context_lens_cpu=[0],
-        max_query_len=q_len,
-        max_seq_len=q_len,
-    )
-    
-    with set_forward_context(md):
-        actual = attn(q, k, v)
-        
-    torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+# Attention reads K/V from the cache only. The model writes the step's K/V
+# (fused RoPE + store) before calling it, so each test stores every token first.
 
 def test_prefill_then_decode_parity():
     num_heads = 4
@@ -61,10 +27,10 @@ def test_prefill_then_decode_parity():
     expected = _naive_causal_attention(q_all, k_all, v_all, attn.scale, attn.num_queries_per_kv)
     
     block_size = 4
-    kv_cache = torch.empty(2, 3, block_size, num_kv_heads, head_dim)
+    kv_cache = torch.zeros(2, 3, block_size, num_kv_heads, head_dim)
     attn.kv_cache = kv_cache
     
-    store_kvcache(k_all[:10], v_all[:10], kv_cache, torch.arange(10))
+    store_kvcache(k_all, v_all, kv_cache, torch.arange(11))
     
     q_decode = q_all[10:11]
     k_decode = k_all[10:11]
@@ -107,11 +73,11 @@ def test_batched_decode():
     exp0 = _naive_causal_attention(q0, k0, v0, attn.scale, attn.num_queries_per_kv)
     exp1 = _naive_causal_attention(q1, k1, v1, attn.scale, attn.num_queries_per_kv)
 
-    kv_cache = torch.empty(2, 8, block_size, num_kv_heads, head_dim)
+    kv_cache = torch.zeros(2, 8, block_size, num_kv_heads, head_dim)
     attn.kv_cache = kv_cache
 
-    store_kvcache(k0[:6], v0[:6], kv_cache, torch.arange(6))
-    store_kvcache(k1[:5], v1[:5], kv_cache, torch.arange(16, 21))
+    store_kvcache(k0, v0, kv_cache, torch.arange(7))
+    store_kvcache(k1, v1, kv_cache, torch.arange(16, 22))
 
     q = torch.cat([q0[6:7], q1[5:6]], dim=0)
     k = torch.cat([k0[6:7], k1[5:6]], dim=0)
@@ -147,28 +113,27 @@ def test_batched_mixed():
     block_size = 4
     
     attn = Attention(num_heads, head_dim, num_kv_heads)
-    kv_cache = torch.empty(2, 6, block_size, num_kv_heads, head_dim)
+    kv_cache = torch.zeros(2, 6, block_size, num_kv_heads, head_dim)
     attn.kv_cache = kv_cache
     
     q0 = torch.randn(5, num_heads, head_dim)
     k0 = torch.randn(5, num_kv_heads, head_dim)
     v0 = torch.randn(5, num_kv_heads, head_dim)
+    store_kvcache(k0, v0, kv_cache, torch.arange(5))
     
     k1_ctx = torch.randn(3, num_kv_heads, head_dim)
     v1_ctx = torch.randn(3, num_kv_heads, head_dim)
-    store_kvcache(k1_ctx, v1_ctx, kv_cache, torch.arange(8, 11))
-    
     q1 = torch.randn(1, num_heads, head_dim)
     k1 = torch.randn(1, num_kv_heads, head_dim)
     v1 = torch.randn(1, num_kv_heads, head_dim)
+    store_kvcache(torch.cat([k1_ctx, k1]), torch.cat([v1_ctx, v1]), kv_cache, torch.arange(8, 12))
     
     k2_ctx = torch.randn(8, num_kv_heads, head_dim)
     v2_ctx = torch.randn(8, num_kv_heads, head_dim)
-    store_kvcache(k2_ctx, v2_ctx, kv_cache, torch.arange(12, 20))
-    
     q2 = torch.randn(1, num_heads, head_dim)
     k2 = torch.randn(1, num_kv_heads, head_dim)
     v2 = torch.randn(1, num_kv_heads, head_dim)
+    store_kvcache(torch.cat([k2_ctx, k2]), torch.cat([v2_ctx, v2]), kv_cache, torch.arange(12, 21))
     
     q_batch = torch.cat([q0, q1, q2], dim=0)
     k_batch = torch.cat([k0, k1, k2], dim=0)
@@ -228,7 +193,7 @@ def test_non_contiguous():
     
     expected = _naive_causal_attention(q_all, k_all, v_all, attn.scale, attn.num_queries_per_kv)
     
-    kv_cache = torch.empty(2, 10, block_size, num_kv_heads, head_dim)
+    kv_cache = torch.zeros(2, 10, block_size, num_kv_heads, head_dim)
     attn.kv_cache = kv_cache
     
     slot_mapping = torch.tensor([
@@ -236,6 +201,7 @@ def test_non_contiguous():
         2*2 + 0, 2*2 + 1,
         5*2 + 0
     ])
+    store_kvcache(k_all, v_all, kv_cache, slot_mapping)
     
     md = AttentionMetadata(
         slot_mapping=slot_mapping,
@@ -333,7 +299,7 @@ def test_paged_prefill_matches_naive_when_cache_is_filled():
 
 
 if __name__ == "__main__":
-    test_prefill_parity()
+    test_paged_prefill_matches_naive_when_cache_is_filled()
     test_prefill_then_decode_parity()
     test_batched_decode()
     test_batched_mixed()

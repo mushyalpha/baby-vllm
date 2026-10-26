@@ -15,3 +15,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["babyvllm*"]
+
+[tool.pytest.ini_options]
+markers = ["gpu: needs a CUDA device"]
