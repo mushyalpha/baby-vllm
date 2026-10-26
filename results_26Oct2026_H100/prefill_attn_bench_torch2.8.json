@@ -1,0 +1,67 @@
+{
+  "gpu": "NVIDIA H100 80GB HBM3",
+  "torch": "2.8.0+cu128",
+  "model": "Qwen/Qwen2.5-7B",
+  "rows": [
+    {
+      "shape": "b64 x 128 fresh prefill",
+      "query_tokens": 8192,
+      "torch_ms": 6.6185760498046875,
+      "triton_ms": 0.14188800007104874,
+      "speedup": 46.646482059726786,
+      "torch_forward_ms": 185.32012939453125,
+      "triton_forward_ms": 3.9728640019893646,
+      "torch_peak_extra_mib": 59.125,
+      "triton_peak_extra_mib": 56.0,
+      "max_abs_diff": 0.0078125
+    },
+    {
+      "shape": "b1 x 2048 fresh prefill",
+      "query_tokens": 2048,
+      "torch_ms": 0.26521599292755127,
+      "triton_ms": 0.23428799957036972,
+      "speedup": 1.1320084400989225,
+      "torch_forward_ms": 7.4260478019714355,
+      "triton_forward_ms": 6.560063987970352,
+      "torch_peak_extra_mib": 64.0,
+      "triton_peak_extra_mib": 14.0,
+      "max_abs_diff": 0.00390625
+    },
+    {
+      "shape": "b8 x (1024 cached + 128)",
+      "query_tokens": 1024,
+      "torch_ms": 2.178783893585205,
+      "triton_ms": 0.14113599807024002,
+      "speedup": 15.437478200996434,
+      "torch_forward_ms": 61.00594902038574,
+      "triton_forward_ms": 3.9518079459667206,
+      "torch_peak_extra_mib": 128.23828125,
+      "triton_peak_extra_mib": 7.0,
+      "max_abs_diff": 0.001953125
+    },
+    {
+      "shape": "b1 x (2048 cached + 4096)",
+      "query_tokens": 4096,
+      "torch_ms": 19.405200004577637,
+      "triton_ms": 1.2672640085220337,
+      "speedup": 15.312673502981633,
+      "torch_forward_ms": 543.3456001281738,
+      "triton_forward_ms": 35.48339223861694,
+      "torch_peak_extra_mib": 6512.10986328125,
+      "triton_peak_extra_mib": 28.0,
+      "max_abs_diff": 0.0009765625
+    },
+    {
+      "shape": "1 x 512 prefill + 63 decodes at 1000",
+      "query_tokens": 575,
+      "torch_ms": 10.878064155578613,
+      "triton_ms": 0.3643520027399063,
+      "speedup": 29.85591975281099,
+      "torch_forward_ms": 304.5857963562012,
+      "triton_forward_ms": 10.201856076717377,
+      "torch_peak_extra_mib": 59.75341796875,
+      "triton_peak_extra_mib": 3.9306640625,
+      "max_abs_diff": 0.00390625
+    }
+  ]
+}
