@@ -34,6 +34,9 @@ class Sequence:
         self.finish_reason = None
         self._prompt_len = len(token_ids)
         self.num_computed_tokens: int = 0
+        # Bumped on every recompute. A preempted sequence gets a new block
+        # table, so (seq_id, num_preemptions) names one table's lifetime.
+        self.num_preemptions: int = 0
         # Chained hash of each full block of token_ids. Append-only, because
         # token_ids is append-only. Filled lazily by KVCacheManager.
         self.block_hashes: list[int] = []
@@ -89,3 +92,4 @@ class Sequence:
     def reset_for_recompute(self) -> None:
         self.status = SequenceState.WAITING
         self.num_computed_tokens = 0
+        self.num_preemptions += 1

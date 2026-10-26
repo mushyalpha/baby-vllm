@@ -62,6 +62,12 @@ class KVCacheManager:
     def get_slot_mapping(self, seq: Sequence, num_new_tokens: int) -> list[int]:
         table = self.request_blocks.get(seq.seq_id, [])
         start = seq.num_computed_tokens
+        if num_new_tokens == 1:
+            # A decode step. Same arithmetic as the loop below, without the
+            # range and the list growth, because it runs once per sequence per step.
+            b, o = divmod(start, self.block_size)
+            assert b < len(table), f"seq {seq.seq_id} pos {start} has no block"
+            return [table[b] * self.block_size + o]
         out = []
         for pos in range(start, start + num_new_tokens):
             b, o = divmod(pos, self.block_size)
@@ -106,7 +112,7 @@ class KVCacheManager:
 
     def can_allocate(self, seq: Sequence, num_new_tokens: int, computed_blocks: list[int] = ()) -> bool:
         # A hit on a block with ref count 0 takes it off the free list too.
-        num_revived = sum(1 for b in computed_blocks if self.ref_counts[b] == 0)
+        num_revived = sum(1 for b in computed_blocks if self.ref_counts[b] == 0) if computed_blocks else 0
         return self.num_free_blocks >= self.num_blocks_needed(seq, num_new_tokens, computed_blocks) + num_revived
 
     def _pop_free_block(self) -> int:
@@ -131,8 +137,9 @@ class KVCacheManager:
         past them before building the slot mapping.
         """
         needed = self.num_blocks_needed(seq, num_new_tokens, computed_blocks)
-
-        assert self.can_allocate(seq, num_new_tokens, computed_blocks), f"OOM: cannot allocate for seq {seq.seq_id}. Free: {self.num_free_blocks}, needed: {needed}"
+        # Same check as can_allocate, without computing num_blocks_needed again.
+        num_revived = sum(1 for b in computed_blocks if self.ref_counts[b] == 0) if computed_blocks else 0
+        assert self.num_free_blocks >= needed + num_revived, f"OOM: cannot allocate for seq {seq.seq_id}. Free: {self.num_free_blocks}, needed: {needed}"
 
         table = self.request_blocks.setdefault(seq.seq_id, [])
         if computed_blocks:

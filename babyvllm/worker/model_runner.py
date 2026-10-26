@@ -5,6 +5,7 @@ import torch
 from babyvllm.layers.attention import Attention
 from babyvllm.models.qwen2 import Qwen2ForCausalLM
 from babyvllm.worker.context import AttentionMetadata, set_forward_context
+from babyvllm.worker.decode_inputs import DecodeInputs
 from babyvllm.worker.graph_runner import CUDAGraphRunner
 from babyvllm.layers.sampler import Sampler
 
@@ -82,13 +83,8 @@ class StaticBuffers:
     slot_mapping: torch.Tensor
     query_start_loc: torch.Tensor
     logits: torch.Tensor
-    # Pinned CPU staging buffers
-    cpu_input_ids: torch.Tensor = None
-    cpu_position_ids: torch.Tensor = None
-    cpu_seq_lens: torch.Tensor = None
-    cpu_context_lens: torch.Tensor = None
-    cpu_slot_mapping: torch.Tensor = None
-    cpu_block_tables: torch.Tensor = None
+    # Greedy argmax of ``logits``, written inside the graph.
+    tokens: torch.Tensor
 
 
 class ModelRunner:
@@ -124,7 +120,7 @@ class ModelRunner:
         self._static: dict[tuple[int, int], StaticBuffers] = {}
         self._graphs: dict[tuple[int, int], CUDAGraphRunner] = {}
         self._pool = None
-        self._seq_lens_cpu: list[int] = []
+        self._decode_inputs: DecodeInputs | None = None
         max_ctx = max(CTX_BUCKETS)
         self.max_blocks_per_seq = (max_ctx + self.block_size - 1) // self.block_size + 1
 
@@ -367,63 +363,40 @@ class ModelRunner:
             slot_mapping=torch.full((B,), dummy_slot, dtype=torch.int64, device=dev),
             query_start_loc=torch.arange(B + 1, dtype=torch.int32, device=dev),
             logits=torch.zeros(B, V, dtype=torch.float32, device=dev),
+            tokens=torch.zeros(B, dtype=torch.int64, device=dev),
         )
-        # Allocate pinned memory for staging
-        buf.cpu_input_ids = torch.zeros(B, dtype=torch.int64, pin_memory=True)
-        buf.cpu_position_ids = torch.zeros(B, dtype=torch.int64, pin_memory=True)
-        buf.cpu_seq_lens = torch.zeros(B, dtype=torch.int32, pin_memory=True)
-        buf.cpu_context_lens = torch.zeros(B, dtype=torch.int32, pin_memory=True)
-        buf.cpu_slot_mapping = torch.full((B,), dummy_slot, dtype=torch.int64, pin_memory=True)
-        buf.cpu_block_tables = torch.full((B, MB), self._dummy_block, dtype=torch.int32, pin_memory=True)
         self._static[key] = buf
         return buf
 
-    def prepare_static_inputs(
+    def _host_decode_inputs(self) -> DecodeInputs:
+        if self._decode_inputs is None:
+            self._decode_inputs = DecodeInputs(
+                max_batch=max(BATCH_BUCKETS),
+                max_blocks=self.max_blocks_per_seq,
+                block_size=self.block_size,
+                dummy_block=self._dummy_block,
+                pin=self.device.type == "cuda",
+            )
+        return self._decode_inputs
+
+    def prepare_decode_inputs(
         self,
-        token_ids: list[int],
-        positions: list[int],
-        block_tables: list[list[int]],
-        seq_lens: list[int],
-        slot_mappings: list[int],
+        seqs,
+        block_tables: dict[int, list[int]],
         batch_bucket: int,
         ctx_bucket: int,
     ) -> StaticBuffers:
+        """Edit the staging arrays for this step and queue the copies to the graph's inputs."""
         buf = self._ensure_static_buffers(batch_bucket, ctx_bucket)
-        B_actual = len(token_ids)
-        dummy_slot = self._dummy_block * self.block_size
-
-        self._seq_lens_cpu = list(seq_lens) + [0] * (batch_bucket - B_actual)
-
-        # 1. Fill CPU pinned buffers directly
-        buf.cpu_input_ids[:B_actual] = torch.tensor(token_ids, dtype=torch.int64)
-        buf.cpu_position_ids[:B_actual] = torch.tensor(positions, dtype=torch.int64)
-        buf.cpu_seq_lens[:B_actual] = torch.tensor(seq_lens, dtype=torch.int32)
-        buf.cpu_context_lens[:B_actual] = torch.tensor([s - 1 for s in seq_lens], dtype=torch.int32)
-        buf.cpu_slot_mapping[:B_actual] = torch.tensor(slot_mappings, dtype=torch.int64)
-        
-        if B_actual < batch_bucket:
-            buf.cpu_input_ids[B_actual:].zero_()
-            buf.cpu_position_ids[B_actual:].zero_()
-            buf.cpu_seq_lens[B_actual:].zero_()
-            buf.cpu_context_lens[B_actual:].zero_()
-            buf.cpu_slot_mapping[B_actual:].fill_(dummy_slot)
-            buf.cpu_block_tables[B_actual:].fill_(self._dummy_block)
-
-        # Batch the block tables formatting on CPU
-        for i, bt in enumerate(block_tables):
-            n = len(bt)
-            buf.cpu_block_tables[i, :n] = torch.tensor(bt, dtype=torch.int32)
-            if n < self.max_blocks_per_seq:
-                buf.cpu_block_tables[i, n:].fill_(self._dummy_block)
-
-        # 2. Issue non-blocking copies to GPU
-        buf.input_ids.copy_(buf.cpu_input_ids, non_blocking=True)
-        buf.position_ids.copy_(buf.cpu_position_ids, non_blocking=True)
-        buf.seq_lens.copy_(buf.cpu_seq_lens, non_blocking=True)
-        buf.context_lens.copy_(buf.cpu_context_lens, non_blocking=True)
-        buf.slot_mapping.copy_(buf.cpu_slot_mapping, non_blocking=True)
-        buf.block_tables.copy_(buf.cpu_block_tables, non_blocking=True)
-
+        host = self._host_decode_inputs()
+        host.update(seqs, block_tables, batch_bucket)
+        B = batch_bucket
+        buf.input_ids.copy_(host.t_input_ids[:B], non_blocking=True)
+        buf.position_ids.copy_(host.t_positions[:B], non_blocking=True)
+        buf.seq_lens.copy_(host.t_seq_lens[:B], non_blocking=True)
+        buf.context_lens.copy_(host.t_context_lens[:B], non_blocking=True)
+        buf.slot_mapping.copy_(host.t_slot_mapping[:B], non_blocking=True)
+        buf.block_tables.copy_(host.t_block_tables[:B], non_blocking=True)
         return buf
 
     @torch.inference_mode()
@@ -434,10 +407,11 @@ class ModelRunner:
         ctx_bucket: int,
     ) -> torch.Tensor:
         B = batch_bucket
-        seq_lens_cpu = (
-            self._seq_lens_cpu[:B] if len(self._seq_lens_cpu) >= B else [0] * B
-        )
-        context_lens_cpu = [max(0, s - 1) for s in seq_lens_cpu]
+        # Host-side copies of the lengths are only read by the torch fallback
+        # paths, which a one-token CUDA step never takes. The values that count
+        # live in buf.seq_lens and buf.context_lens.
+        seq_lens_cpu = [ctx_bucket] * B
+        context_lens_cpu = [ctx_bucket - 1] * B
         attn_metadata = AttentionMetadata(
             slot_mapping=buf.slot_mapping[:B],
             block_tables=buf.block_tables[:B],
@@ -456,6 +430,9 @@ class ModelRunner:
 
         logits = self.model.compute_logits(hidden)
         buf.logits[:B].copy_(logits)
+        # Greedy sampling inside the graph, on the same fp32 values the eager
+        # sampler used. Stochastic requests still read buf.logits.
+        buf.tokens[:B].copy_(torch.argmax(buf.logits[:B], dim=-1))
         return buf.logits
 
     def capture_one(self, batch_bucket: int, ctx_bucket: int, warmup_steps: int = 3):
@@ -464,9 +441,6 @@ class ModelRunner:
             return self._graphs[key]
 
         buf = self._ensure_static_buffers(batch_bucket, ctx_bucket)
-        if len(self._seq_lens_cpu) < batch_bucket:
-            self._seq_lens_cpu = [1] * batch_bucket
-
         side_stream = torch.cuda.Stream()
         with torch.cuda.stream(side_stream):
             for _ in range(warmup_steps):
@@ -497,37 +471,28 @@ class ModelRunner:
 
     def _execute_decode_graph(self, scheduler_output) -> dict[int, int]:
         seqs = scheduler_output.scheduled_sequences
-        token_ids = []
-        positions = []
-        block_tables = []
-        seq_lens = []
-        slot_mappings = []
-        for seq in seqs:
-            start = seq.num_computed_tokens
-            token_ids.append(seq.token_ids[start])
-            positions.append(start)
-            seq_lens.append(start + 1)
-            block_tables.append(scheduler_output.block_tables[seq.seq_id])
-            slot_mappings.append(scheduler_output.slot_mappings[seq.seq_id][0])
-
-        bb = ceil_to_bucket(len(seqs), BATCH_BUCKETS)
-        cb = ceil_to_bucket(max(seq_lens), CTX_BUCKETS)
+        n = len(seqs)
+        bb = ceil_to_bucket(n, BATCH_BUCKETS)
+        cb = ceil_to_bucket(max(s.num_computed_tokens for s in seqs) + 1, CTX_BUCKETS)
         assert bb is not None and cb is not None
 
         with nvtx_range("prepare_inputs"):
-            buf = self.prepare_static_inputs(
-                token_ids, positions, block_tables, seq_lens, slot_mappings, bb, cb
-            )
+            buf = self.prepare_decode_inputs(seqs, scheduler_output.block_tables, bb, cb)
 
         with nvtx_range("forward"):
             self.capture_one(bb, cb)
             self.replay(buf, bb, cb)
 
         with nvtx_range("sample"):
-            sampled_tokens = self.sampler(
-                buf.logits[: len(seqs)], None, scheduler_output
-            )
-        return sampled_tokens
+            if all(s.sampling_params.temperature == 0.0 for s in seqs):
+                # Argmax already ran inside the graph. One 8-byte-per-row copy
+                # to pinned memory, one stream sync, no extra kernels.
+                host = self._decode_inputs
+                host.t_tokens[:bb].copy_(buf.tokens[:bb], non_blocking=True)
+                torch.cuda.current_stream().synchronize()
+                tokens = host.tokens[:n].tolist()
+                return {s.seq_id: t for s, t in zip(seqs, tokens)}
+            return self.sampler(buf.logits[:n], None, scheduler_output)
 
     @torch.inference_mode()
     def _execute_eager(self, scheduler_output) -> dict[int, int]:
