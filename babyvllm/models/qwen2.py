@@ -127,9 +127,11 @@ class Qwen2ForCausalLM(nn.Module):
         else:
             self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
 
-    def compute_logits(self, hidden):
+    def compute_logits(self, hidden, out=None):
         w = self.model.embed_tokens.weight if self.lm_head is None else self.lm_head.weight
-        return F.linear(hidden, w)
+        if out is None:
+            return F.linear(hidden, w)
+        return torch.mm(hidden, w.t(), out=out)
 
     def forward(self, input_ids, positions):
         return self.model(input_ids, positions)
