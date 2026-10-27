@@ -1,3 +1,4 @@
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -19,6 +20,12 @@ CTX_BUCKETS = [256, 2048]
 # real step. 128 tokens still crosses the GEMV/GEMM boundary, and a math-backend
 # score matrix at that length is 64 KiB per head.
 MEMORY_PROFILE_TOKENS = 128
+
+# Greedy argmax inside the decode graph. "fp32" copies the bf16 logits to fp32
+# and runs torch.argmax. "bf16" has the LM head write bf16 logits straight into
+# the static buffer and runs torch.argmax on them. "triton" does the same with
+# a split-row kernel. All three return the same tokens; kept switchable for A/B runs.
+GREEDY_ARGMAX_MODES = ("fp32", "bf16", "triton")
 
 
 def profile_forward_tokens(max_batched_tokens: int, max_position_embeddings: int) -> int:
@@ -121,6 +128,9 @@ class ModelRunner:
         self._graphs: dict[tuple[int, int], CUDAGraphRunner] = {}
         self._pool = None
         self._decode_inputs: DecodeInputs | None = None
+        self.greedy_argmax = os.environ.get("BABYVLLM_GREEDY_ARGMAX", "fp32")
+        if self.greedy_argmax not in GREEDY_ARGMAX_MODES:
+            raise ValueError(f"BABYVLLM_GREEDY_ARGMAX must be one of {GREEDY_ARGMAX_MODES}")
         max_ctx = max(CTX_BUCKETS)
         self.max_blocks_per_seq = (max_ctx + self.block_size - 1) // self.block_size + 1
 
@@ -362,7 +372,11 @@ class ModelRunner:
             context_lens=torch.zeros(B, dtype=torch.int32, device=dev),
             slot_mapping=torch.full((B,), dummy_slot, dtype=torch.int64, device=dev),
             query_start_loc=torch.arange(B + 1, dtype=torch.int32, device=dev),
-            logits=torch.zeros(B, V, dtype=torch.float32, device=dev),
+            logits=torch.zeros(
+                B, V,
+                dtype=torch.float32 if self.greedy_argmax == "fp32" else self.dtype,
+                device=dev,
+            ),
             tokens=torch.zeros(B, dtype=torch.int64, device=dev),
         )
         self._static[key] = buf
@@ -428,11 +442,18 @@ class ModelRunner:
         with set_forward_context(attn_metadata):
             hidden = self.model(buf.input_ids[:B], buf.position_ids[:B])
 
-        logits = self.model.compute_logits(hidden)
-        buf.logits[:B].copy_(logits)
-        # Greedy sampling inside the graph, on the same fp32 values the eager
-        # sampler used. Stochastic requests still read buf.logits.
-        buf.tokens[:B].copy_(torch.argmax(buf.logits[:B], dim=-1))
+        # Greedy sampling inside the graph. Stochastic requests read buf.logits,
+        # and the sampler upcasts them, which is exact from bf16.
+        if self.greedy_argmax == "fp32":
+            buf.logits[:B].copy_(self.model.compute_logits(hidden))
+            buf.tokens[:B].copy_(torch.argmax(buf.logits[:B], dim=-1))
+        else:
+            self.model.compute_logits(hidden, out=buf.logits[:B])
+            if self.greedy_argmax == "triton":
+                from babyvllm.kernels.argmax import greedy_argmax
+                greedy_argmax(buf.logits[:B], buf.tokens[:B])
+            else:
+                buf.tokens[:B].copy_(torch.argmax(buf.logits[:B], dim=-1))
         return buf.logits
 
     def capture_one(self, batch_bucket: int, ctx_bucket: int, warmup_steps: int = 3):
