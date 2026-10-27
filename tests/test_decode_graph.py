@@ -37,19 +37,24 @@ def generate(use_graphs: bool, max_tokens: int = 40):
     return ids, graphs
 
 
-def test_graph_greedy_tokens_match_eager_decode():
+@pytest.mark.parametrize("mode", ["fp32", "bf16", "triton"])
+def test_graph_greedy_tokens_match_eager_decode(mode, monkeypatch):
     eager, eager_graphs = generate(False)
+    monkeypatch.setenv("BABYVLLM_GREEDY_ARGMAX", mode)
     graphed, n_graphs = generate(True)
     assert eager_graphs == 0
     assert n_graphs > 0, "decode never took the graph path"
     assert graphed == eager
 
 
-def test_graph_tokens_buffer_is_argmax_of_logits():
+@pytest.mark.parametrize("mode", ["fp32", "bf16", "triton"])
+def test_graph_tokens_buffer_is_argmax_of_logits(mode, monkeypatch):
     from babyvllm.llm import LLM
     from babyvllm.sequence import SamplingParams
 
+    monkeypatch.setenv("BABYVLLM_GREEDY_ARGMAX", mode)
     llm = LLM(MODEL, use_cuda_graphs=True)
+    assert llm.model_runner.greedy_argmax == mode
     runner = llm.model_runner
     params = SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True)
     for p in PROMPTS[:3]:
@@ -65,10 +70,12 @@ def test_graph_tokens_buffer_is_argmax_of_logits():
     assert seen
 
 
-def test_mixed_greedy_and_sampled_batch_keeps_greedy_rows_exact():
+@pytest.mark.parametrize("mode", ["fp32", "triton"])
+def test_mixed_greedy_and_sampled_batch_keeps_greedy_rows_exact(mode, monkeypatch):
     from babyvllm.llm import LLM
     from babyvllm.sequence import SamplingParams
 
+    monkeypatch.setenv("BABYVLLM_GREEDY_ARGMAX", mode)
     greedy = SamplingParams(temperature=0.0, max_tokens=24, ignore_eos=True)
     hot = SamplingParams(temperature=0.8, top_p=0.9, max_tokens=24, ignore_eos=True)
 
