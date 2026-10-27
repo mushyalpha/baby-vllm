@@ -293,6 +293,10 @@ def run_length(engine, args, base, vocab, device, system_len: int) -> dict[str, 
         "expected_hit_rate_sequential": round(
             expected_hit_rate(system_len, args.suffix_len, bs, args.n_seq), 4
         ),
+        "expected_warm_hit_rate": round(
+            cached_tokens_per_hit(system_len, system_len + args.suffix_len, bs)
+            / (system_len + args.suffix_len), 4
+        ),
         "expected_hit_rate_burst": round(
             expected_hit_rate(system_len, args.suffix_len, bs, args.burst), 4
         ),
@@ -332,7 +336,7 @@ def print_tables(results: list[dict[str, Any]], args, name: str, can_publish: bo
             f"| {r['system_len']} | {m(off, 'sequential', 'warm_ttft_ms')} "
             f"| {m(on, 'sequential', 'cold_first_ttft_ms')} | {m(on, 'sequential', 'warm_ttft_ms')} "
             f"| {speed:.2f}x | {on['sequential']['warm_hit_rate']['median'] * 100:.1f}% "
-            f"| {r['expected_hit_rate_sequential'] * 100:.1f}% overall |"
+            f"| {r['expected_warm_hit_rate'] * 100:.1f}% |"
         )
     print(f"\nBurst of {args.burst} requests onto an empty cache\n")
     print("| System prompt | Mean TTFT off | Mean TTFT on | Last TTFT off | Last TTFT on | Peak KV blocks off → on | Hit rate on | Expected |")

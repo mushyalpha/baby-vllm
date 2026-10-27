@@ -31,6 +31,8 @@ print("GPU:", name, "| torch", torch.__version__)
 assert "H100" in name, f"published numbers need an H100, got {name}"
 PY
 
+python -c "import pytest, accelerate" 2>/dev/null || python -m pip install -q pytest accelerate
+
 echo "== 0. GPU unit tests (Qwen2.5-0.5B, correctness only, nothing here is published) =="
 python -m pytest tests/test_decode_graph.py tests/test_paged_prefill.py -q -m gpu 2>&1 | tee "$OUT/gpu_tests.log"
 

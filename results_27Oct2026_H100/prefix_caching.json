@@ -1,0 +1,931 @@
+{
+  "metadata": {
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "model": "Qwen/Qwen2.5-7B",
+    "dtype": "bfloat16",
+    "publishable": true,
+    "block_size": 16,
+    "system_lens": [
+      128,
+      512,
+      1024,
+      1536
+    ],
+    "suffix_len": 64,
+    "n_seq": 16,
+    "burst": 32,
+    "burst_max_tokens": 32,
+    "repeats": 3,
+    "prefill_budget": 8192,
+    "pytorch_version": "2.13.0+cu130",
+    "hf_version": "5.19.0",
+    "babyvllm_prefill_attn": "triton",
+    "command": "python benchmarks/benchmark_prefix_caching.py --model Qwen/Qwen2.5-7B --system-lens 128,512,1024,1536 --suffix-len 64 --n-seq 16 --burst 32 --burst-max-tokens 32 --repeats 3 --out results_27Oct2026_H100/prefix_caching.json",
+    "definition": {
+      "warm_ttft_ms": "sequential: median over requests 1..n-1 of wall clock to the first token, one request in flight",
+      "cold_first_ttft_ms": "sequential: request 0 on an empty cache",
+      "ttft_mean_ms / ttft_max_ms": "burst: mean and max over requests of submit-to-first-token wall clock",
+      "hit_rate": "KVCacheManager counter: cached prompt tokens / prompt tokens queried at admission",
+      "warm_hit_rate": "sequential hit rate over requests 1..n-1",
+      "peak_blocks": "most KV blocks held at the start of any step"
+    }
+  },
+  "lengths": [
+    {
+      "system_len": 128,
+      "suffix_len": 64,
+      "expected_hit_rate_sequential": 0.625,
+      "expected_hit_rate_burst": 0.6458,
+      "off": {
+        "sequential": {
+          "cold_first_ttft_ms": {
+            "median": 8.4766,
+            "ci95": 0.041
+          },
+          "warm_ttft_ms": {
+            "median": 8.3385,
+            "ci95": 0.0568
+          },
+          "hit_rate": {
+            "median": 0.0,
+            "ci95": 0.0
+          },
+          "warm_hit_rate": {
+            "median": 0.0,
+            "ci95": 0.0
+          }
+        },
+        "burst": {
+          "ttft_mean_ms": {
+            "median": 126.8421,
+            "ci95": 0.4852
+          },
+          "ttft_p50_ms": {
+            "median": 126.8421,
+            "ci95": 0.4852
+          },
+          "ttft_max_ms": {
+            "median": 126.8421,
+            "ci95": 0.4852
+          },
+          "total_ms": {
+            "median": 315.1955,
+            "ci95": 0.3193
+          },
+          "peak_blocks": {
+            "median": 448.0,
+            "ci95": 0.0
+          },
+          "hit_rate": {
+            "median": 0.0,
+            "ci95": 0.0
+          },
+          "prefill_tokens_computed": {
+            "median": 6144.0,
+            "ci95": 0.0
+          }
+        }
+      },
+      "on": {
+        "sequential": {
+          "cold_first_ttft_ms": {
+            "median": 8.5099,
+            "ci95": 0.1907
+          },
+          "warm_ttft_ms": {
+            "median": 8.1444,
+            "ci95": 0.0873
+          },
+          "hit_rate": {
+            "median": 0.625,
+            "ci95": 0.0
+          },
+          "warm_hit_rate": {
+            "median": 0.6667,
+            "ci95": 0.0
+          }
+        },
+        "burst": {
+          "ttft_mean_ms": {
+            "median": 46.3284,
+            "ci95": 0.2667
+          },
+          "ttft_p50_ms": {
+            "median": 46.3284,
+            "ci95": 0.2667
+          },
+          "ttft_max_ms": {
+            "median": 46.3284,
+            "ci95": 0.2667
+          },
+          "total_ms": {
+            "median": 233.9434,
+            "ci95": 0.5068
+          },
+          "peak_blocks": {
+            "median": 200.0,
+            "ci95": 0.0
+          },
+          "hit_rate": {
+            "median": 0.6458,
+            "ci95": 0.0
+          },
+          "prefill_tokens_computed": {
+            "median": 2176.0,
+            "ci95": 0.0
+          }
+        }
+      },
+      "greedy_match_sequential": {
+        "match": true,
+        "sequences": 16,
+        "mismatched_sequences": 0
+      },
+      "greedy_match_burst": {
+        "match": true,
+        "sequences": 32,
+        "mismatched_sequences": 0
+      },
+      "trials": {
+        "off": [
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 8.476629969663918,
+              "warm_ttft_ms": 8.27969890087843,
+              "hit_rate": 0.0,
+              "warm_hit_rate": 0.0
+            },
+            "burst": {
+              "ttft_mean_ms": 127.22055497579277,
+              "ttft_p50_ms": 127.22055497579277,
+              "ttft_max_ms": 127.22055497579277,
+              "total_ms": 315.3604849940166,
+              "peak_blocks": 448,
+              "hit_rate": 0.0,
+              "prefill_tokens_computed": 6144
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 8.516296045854688,
+              "warm_ttft_ms": 8.37963295634836,
+              "hit_rate": 0.0,
+              "warm_hit_rate": 0.0
+            },
+            "burst": {
+              "ttft_mean_ms": 126.8421100685373,
+              "ttft_p50_ms": 126.8421100685373,
+              "ttft_max_ms": 126.8421100685373,
+              "total_ms": 314.8105770815164,
+              "peak_blocks": 448,
+              "hit_rate": 0.0,
+              "prefill_tokens_computed": 6144
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 8.444000035524368,
+              "warm_ttft_ms": 8.33847001194954,
+              "hit_rate": 0.0,
+              "warm_hit_rate": 0.0
+            },
+            "burst": {
+              "ttft_mean_ms": 126.36485602706671,
+              "ttft_p50_ms": 126.36485602706671,
+              "ttft_max_ms": 126.36485602706671,
+              "total_ms": 315.19554008264095,
+              "peak_blocks": 448,
+              "hit_rate": 0.0,
+              "prefill_tokens_computed": 6144
+            }
+          }
+        ],
+        "on": [
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 8.778083953075111,
+              "warm_ttft_ms": 8.04272503592074,
+              "hit_rate": 0.625,
+              "warm_hit_rate": 0.6666666666666666
+            },
+            "burst": {
+              "ttft_mean_ms": 45.93413497786969,
+              "ttft_p50_ms": 45.93413497786969,
+              "ttft_max_ms": 45.93413497786969,
+              "total_ms": 233.20620600134134,
+              "peak_blocks": 200,
+              "hit_rate": 0.6458333333333334,
+              "prefill_tokens_computed": 2176
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 8.46714701037854,
+              "warm_ttft_ms": 8.144411025568843,
+              "hit_rate": 0.625,
+              "warm_hit_rate": 0.6666666666666666
+            },
+            "burst": {
+              "ttft_mean_ms": 46.32838198449463,
+              "ttft_p50_ms": 46.32838198449463,
+              "ttft_max_ms": 46.32838198449463,
+              "total_ms": 234.0153019176796,
+              "peak_blocks": 200,
+              "hit_rate": 0.6458333333333334,
+              "prefill_tokens_computed": 2176
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 8.509886916726828,
+              "warm_ttft_ms": 8.194084046408534,
+              "hit_rate": 0.625,
+              "warm_hit_rate": 0.6666666666666666
+            },
+            "burst": {
+              "ttft_mean_ms": 46.354900929145515,
+              "ttft_p50_ms": 46.354900929145515,
+              "ttft_max_ms": 46.354900929145515,
+              "total_ms": 233.94340090453625,
+              "peak_blocks": 200,
+              "hit_rate": 0.6458333333333334,
+              "prefill_tokens_computed": 2176
+            }
+          }
+        ]
+      }
+    },
+    {
+      "system_len": 512,
+      "suffix_len": 64,
+      "expected_hit_rate_sequential": 0.8333,
+      "expected_hit_rate_burst": 0.8611,
+      "off": {
+        "sequential": {
+          "cold_first_ttft_ms": {
+            "median": 16.3817,
+            "ci95": 0.179
+          },
+          "warm_ttft_ms": {
+            "median": 16.324,
+            "ci95": 0.0268
+          },
+          "hit_rate": {
+            "median": 0.0,
+            "ci95": 0.0
+          },
+          "warm_hit_rate": {
+            "median": 0.0,
+            "ci95": 0.0
+          }
+        },
+        "burst": {
+          "ttft_mean_ms": {
+            "median": 271.1455,
+            "ci95": 1.1872
+          },
+          "ttft_p50_ms": {
+            "median": 338.9117,
+            "ci95": 1.6941
+          },
+          "ttft_max_ms": {
+            "median": 394.6458,
+            "ci95": 1.2365
+          },
+          "total_ms": {
+            "median": 600.3191,
+            "ci95": 1.4992
+          },
+          "peak_blocks": {
+            "median": 1216.0,
+            "ci95": 0.0
+          },
+          "hit_rate": {
+            "median": 0.0,
+            "ci95": 0.0
+          },
+          "prefill_tokens_computed": {
+            "median": 18432.0,
+            "ci95": 0.0
+          }
+        }
+      },
+      "on": {
+        "sequential": {
+          "cold_first_ttft_ms": {
+            "median": 16.1314,
+            "ci95": 0.3344
+          },
+          "warm_ttft_ms": {
+            "median": 8.2062,
+            "ci95": 0.0931
+          },
+          "hit_rate": {
+            "median": 0.8333,
+            "ci95": 0.0
+          },
+          "warm_hit_rate": {
+            "median": 0.8889,
+            "ci95": 0.0
+          }
+        },
+        "burst": {
+          "ttft_mean_ms": {
+            "median": 54.8215,
+            "ci95": 0.6277
+          },
+          "ttft_p50_ms": {
+            "median": 54.8215,
+            "ci95": 0.6277
+          },
+          "ttft_max_ms": {
+            "median": 54.8215,
+            "ci95": 0.6277
+          },
+          "total_ms": {
+            "median": 259.0647,
+            "ci95": 0.8309
+          },
+          "peak_blocks": {
+            "median": 224.0,
+            "ci95": 0.0
+          },
+          "hit_rate": {
+            "median": 0.8611,
+            "ci95": 0.0
+          },
+          "prefill_tokens_computed": {
+            "median": 2560.0,
+            "ci95": 0.0
+          }
+        }
+      },
+      "greedy_match_sequential": {
+        "match": true,
+        "sequences": 16,
+        "mismatched_sequences": 0
+      },
+      "greedy_match_burst": {
+        "match": true,
+        "sequences": 32,
+        "mismatched_sequences": 0
+      },
+      "trials": {
+        "off": [
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 16.381721012294292,
+              "warm_ttft_ms": 16.300156014040112,
+              "hit_rate": 0.0,
+              "warm_hit_rate": 0.0
+            },
+            "burst": {
+              "ttft_mean_ms": 271.1454801610671,
+              "ttft_p50_ms": 338.91171298455447,
+              "ttft_max_ms": 393.33759690634906,
+              "total_ms": 598.5817709006369,
+              "peak_blocks": 1216,
+              "hit_rate": 0.0,
+              "prefill_tokens_computed": 18432
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 16.155369929037988,
+              "warm_ttft_ms": 16.3239820394665,
+              "hit_rate": 0.0,
+              "warm_hit_rate": 0.0
+            },
+            "burst": {
+              "ttft_mean_ms": 270.3394031850621,
+              "ttft_p50_ms": 337.79770706314594,
+              "ttft_max_ms": 395.5077270511538,
+              "total_ms": 601.1830980423838,
+              "peak_blocks": 1216,
+              "hit_rate": 0.0,
+              "prefill_tokens_computed": 18432
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 16.459948965348303,
+              "warm_ttft_ms": 16.34752203244716,
+              "hit_rate": 0.0,
+              "warm_hit_rate": 0.0
+            },
+            "burst": {
+              "ttft_mean_ms": 272.4202069803141,
+              "ttft_p50_ms": 340.7615510514006,
+              "ttft_max_ms": 394.6457609999925,
+              "total_ms": 600.3191330237314,
+              "peak_blocks": 1216,
+              "hit_rate": 0.0,
+              "prefill_tokens_computed": 18432
+            }
+          }
+        ],
+        "on": [
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 16.063902992755175,
+              "warm_ttft_ms": 8.07174202054739,
+              "hit_rate": 0.8333333333333334,
+              "warm_hit_rate": 0.8888888888888888
+            },
+            "burst": {
+              "ttft_mean_ms": 54.82148099690676,
+              "ttft_p50_ms": 54.82148099690676,
+              "ttft_max_ms": 54.82148099690676,
+              "total_ms": 259.0907060075551,
+              "peak_blocks": 224,
+              "hit_rate": 0.8611111111111112,
+              "prefill_tokens_computed": 2560
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 16.606094897724688,
+              "warm_ttft_ms": 8.206248050555587,
+              "hit_rate": 0.8333333333333334,
+              "warm_hit_rate": 0.8888888888888888
+            },
+            "burst": {
+              "ttft_mean_ms": 53.945068968459964,
+              "ttft_p50_ms": 53.945068968459964,
+              "ttft_max_ms": 53.945068968459964,
+              "total_ms": 257.8061710810289,
+              "peak_blocks": 224,
+              "hit_rate": 0.8611111111111112,
+              "prefill_tokens_computed": 2560
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 16.131357988342643,
+              "warm_ttft_ms": 8.221114985644817,
+              "hit_rate": 0.8333333333333334,
+              "warm_hit_rate": 0.8888888888888888
+            },
+            "burst": {
+              "ttft_mean_ms": 54.97232999186963,
+              "ttft_p50_ms": 54.97232999186963,
+              "ttft_max_ms": 54.97232999186963,
+              "total_ms": 259.0646999888122,
+              "peak_blocks": 224,
+              "hit_rate": 0.8611111111111112,
+              "prefill_tokens_computed": 2560
+            }
+          }
+        ]
+      }
+    },
+    {
+      "system_len": 1024,
+      "suffix_len": 64,
+      "expected_hit_rate_sequential": 0.8824,
+      "expected_hit_rate_burst": 0.9118,
+      "off": {
+        "sequential": {
+          "cold_first_ttft_ms": {
+            "median": 24.4694,
+            "ci95": 0.1713
+          },
+          "warm_ttft_ms": {
+            "median": 25.9092,
+            "ci95": 0.2539
+          },
+          "hit_rate": {
+            "median": 0.0,
+            "ci95": 0.0
+          },
+          "warm_hit_rate": {
+            "median": 0.0,
+            "ci95": 0.0
+          }
+        },
+        "burst": {
+          "ttft_mean_ms": {
+            "median": 460.0442,
+            "ci95": 3.1449
+          },
+          "ttft_p50_ms": {
+            "median": 500.9746,
+            "ci95": 2.0077
+          },
+          "ttft_max_ms": {
+            "median": 774.4494,
+            "ci95": 5.52
+          },
+          "total_ms": {
+            "median": 997.3904,
+            "ci95": 5.263
+          },
+          "peak_blocks": {
+            "median": 2240.0,
+            "ci95": 0.0
+          },
+          "hit_rate": {
+            "median": 0.0,
+            "ci95": 0.0
+          },
+          "prefill_tokens_computed": {
+            "median": 34816.0,
+            "ci95": 0.0
+          }
+        }
+      },
+      "on": {
+        "sequential": {
+          "cold_first_ttft_ms": {
+            "median": 24.4595,
+            "ci95": 0.0465
+          },
+          "warm_ttft_ms": {
+            "median": 8.3316,
+            "ci95": 0.0461
+          },
+          "hit_rate": {
+            "median": 0.8824,
+            "ci95": 0.0
+          },
+          "warm_hit_rate": {
+            "median": 0.9412,
+            "ci95": 0.0
+          }
+        },
+        "burst": {
+          "ttft_mean_ms": {
+            "median": 68.1982,
+            "ci95": 0.2013
+          },
+          "ttft_p50_ms": {
+            "median": 68.1982,
+            "ci95": 0.2013
+          },
+          "ttft_max_ms": {
+            "median": 68.1982,
+            "ci95": 0.2013
+          },
+          "total_ms": {
+            "median": 288.6666,
+            "ci95": 0.3745
+          },
+          "peak_blocks": {
+            "median": 256.0,
+            "ci95": 0.0
+          },
+          "hit_rate": {
+            "median": 0.9118,
+            "ci95": 0.0
+          },
+          "prefill_tokens_computed": {
+            "median": 3072.0,
+            "ci95": 0.0
+          }
+        }
+      },
+      "greedy_match_sequential": {
+        "match": true,
+        "sequences": 16,
+        "mismatched_sequences": 0
+      },
+      "greedy_match_burst": {
+        "match": true,
+        "sequences": 32,
+        "mismatched_sequences": 0
+      },
+      "trials": {
+        "off": [
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 24.524478940293193,
+              "warm_ttft_ms": 25.829080026596785,
+              "hit_rate": 0.0,
+              "warm_hit_rate": 0.0
+            },
+            "burst": {
+              "ttft_mean_ms": 464.02719393518055,
+              "ttft_p50_ms": 503.9824169361964,
+              "ttft_max_ms": 780.4785369662568,
+              "total_ms": 1003.0062709702179,
+              "peak_blocks": 2240,
+              "hit_rate": 0.0,
+              "prefill_tokens_computed": 34816
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 24.469419033266604,
+              "warm_ttft_ms": 25.909165968187153,
+              "hit_rate": 0.0,
+              "warm_hit_rate": 0.0
+            },
+            "burst": {
+              "ttft_mean_ms": 460.04422744954354,
+              "ttft_p50_ms": 500.8482680423185,
+              "ttft_max_ms": 774.4494440266863,
+              "total_ms": 997.3904009675607,
+              "peak_blocks": 2240,
+              "hit_rate": 0.0,
+              "prefill_tokens_computed": 34816
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 24.239069083705544,
+              "warm_ttft_ms": 26.25144796911627,
+              "hit_rate": 0.0,
+              "warm_hit_rate": 0.0
+            },
+            "burst": {
+              "ttft_mean_ms": 458.67826484391117,
+              "ttft_p50_ms": 500.9745820425451,
+              "ttft_max_ms": 770.82141302526,
+              "total_ms": 993.776467978023,
+              "peak_blocks": 2240,
+              "hit_rate": 0.0,
+              "prefill_tokens_computed": 34816
+            }
+          }
+        ],
+        "on": [
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 24.446905008517206,
+              "warm_ttft_ms": 8.331560995429754,
+              "hit_rate": 0.8823529411764706,
+              "warm_hit_rate": 0.9411764705882353
+            },
+            "burst": {
+              "ttft_mean_ms": 68.35836498066783,
+              "ttft_p50_ms": 68.35836498066783,
+              "ttft_max_ms": 68.35836498066783,
+              "total_ms": 288.5353749152273,
+              "peak_blocks": 256,
+              "hit_rate": 0.9117647058823529,
+              "prefill_tokens_computed": 3072
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 24.459467036649585,
+              "warm_ttft_ms": 8.297211024910212,
+              "hit_rate": 0.8823529411764706,
+              "warm_hit_rate": 0.9411764705882353
+            },
+            "burst": {
+              "ttft_mean_ms": 68.19817901123315,
+              "ttft_p50_ms": 68.19817901123315,
+              "ttft_max_ms": 68.19817901123315,
+              "total_ms": 289.162811008282,
+              "peak_blocks": 256,
+              "hit_rate": 0.9117647058823529,
+              "prefill_tokens_computed": 3072
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 24.52345401979983,
+              "warm_ttft_ms": 8.378337020985782,
+              "hit_rate": 0.8823529411764706,
+              "warm_hit_rate": 0.9411764705882353
+            },
+            "burst": {
+              "ttft_mean_ms": 68.00319708418101,
+              "ttft_p50_ms": 68.00319708418101,
+              "ttft_max_ms": 68.00319708418101,
+              "total_ms": 288.66659209597856,
+              "peak_blocks": 256,
+              "hit_rate": 0.9117647058823529,
+              "prefill_tokens_computed": 3072
+            }
+          }
+        ]
+      }
+    },
+    {
+      "system_len": 1536,
+      "suffix_len": 64,
+      "expected_hit_rate_sequential": 0.9,
+      "expected_hit_rate_burst": 0.93,
+      "off": {
+        "sequential": {
+          "cold_first_ttft_ms": {
+            "median": 39.3631,
+            "ci95": 0.3749
+          },
+          "warm_ttft_ms": {
+            "median": 40.6123,
+            "ci95": 0.1009
+          },
+          "hit_rate": {
+            "median": 0.0,
+            "ci95": 0.0
+          },
+          "warm_hit_rate": {
+            "median": 0.0,
+            "ci95": 0.0
+          }
+        },
+        "burst": {
+          "ttft_mean_ms": {
+            "median": 678.1031,
+            "ci95": 2.1079
+          },
+          "ttft_p50_ms": {
+            "median": 735.8148,
+            "ci95": 3.2163
+          },
+          "ttft_max_ms": {
+            "median": 1188.908,
+            "ci95": 2.2261
+          },
+          "total_ms": {
+            "median": 1424.788,
+            "ci95": 2.3851
+          },
+          "peak_blocks": {
+            "median": 3264.0,
+            "ci95": 0.0
+          },
+          "hit_rate": {
+            "median": 0.0,
+            "ci95": 0.0
+          },
+          "prefill_tokens_computed": {
+            "median": 51200.0,
+            "ci95": 0.0
+          }
+        }
+      },
+      "on": {
+        "sequential": {
+          "cold_first_ttft_ms": {
+            "median": 39.3448,
+            "ci95": 0.2431
+          },
+          "warm_ttft_ms": {
+            "median": 8.9138,
+            "ci95": 0.029
+          },
+          "hit_rate": {
+            "median": 0.9,
+            "ci95": 0.0
+          },
+          "warm_hit_rate": {
+            "median": 0.96,
+            "ci95": 0.0
+          }
+        },
+        "burst": {
+          "ttft_mean_ms": {
+            "median": 83.2221,
+            "ci95": 0.5968
+          },
+          "ttft_p50_ms": {
+            "median": 83.2221,
+            "ci95": 0.5968
+          },
+          "ttft_max_ms": {
+            "median": 83.2221,
+            "ci95": 0.5968
+          },
+          "total_ms": {
+            "median": 317.4524,
+            "ci95": 1.011
+          },
+          "peak_blocks": {
+            "median": 288.0,
+            "ci95": 0.0
+          },
+          "hit_rate": {
+            "median": 0.93,
+            "ci95": 0.0
+          },
+          "prefill_tokens_computed": {
+            "median": 3584.0,
+            "ci95": 0.0
+          }
+        }
+      },
+      "greedy_match_sequential": {
+        "match": true,
+        "sequences": 16,
+        "mismatched_sequences": 0
+      },
+      "greedy_match_burst": {
+        "match": true,
+        "sequences": 32,
+        "mismatched_sequences": 0
+      },
+      "trials": {
+        "off": [
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 39.53186399303377,
+              "warm_ttft_ms": 40.70495394989848,
+              "hit_rate": 0.0,
+              "warm_hit_rate": 0.0
+            },
+            "burst": {
+              "ttft_mean_ms": 675.0491016246087,
+              "ttft_p50_ms": 731.4980659866706,
+              "ttft_max_ms": 1185.600848053582,
+              "total_ms": 1421.5716500766575,
+              "peak_blocks": 3264,
+              "hit_rate": 0.0,
+              "prefill_tokens_computed": 51200
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 39.36314303427935,
+              "warm_ttft_ms": 40.52661405876279,
+              "hit_rate": 0.0,
+              "warm_hit_rate": 0.0
+            },
+            "burst": {
+              "ttft_mean_ms": 678.1030637503136,
+              "ttft_p50_ms": 735.814776038751,
+              "ttft_max_ms": 1188.907969975844,
+              "total_ms": 1424.7879970353097,
+              "peak_blocks": 3264,
+              "hit_rate": 0.0,
+              "prefill_tokens_computed": 51200
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 38.89266890473664,
+              "warm_ttft_ms": 40.61232996173203,
+              "hit_rate": 0.0,
+              "warm_hit_rate": 0.0
+            },
+            "burst": {
+              "ttft_mean_ms": 678.4239977569086,
+              "ttft_p50_ms": 736.8594619911164,
+              "ttft_max_ms": 1189.1001919284463,
+              "total_ms": 1425.539608928375,
+              "peak_blocks": 3264,
+              "hit_rate": 0.0,
+              "prefill_tokens_computed": 51200
+            }
+          }
+        ],
+        "on": [
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 38.977422984316945,
+              "warm_ttft_ms": 8.913828991353512,
+              "hit_rate": 0.9,
+              "warm_hit_rate": 0.96
+            },
+            "burst": {
+              "ttft_mean_ms": 83.94656796008348,
+              "ttft_p50_ms": 83.94656796008348,
+              "ttft_max_ms": 83.94656796008348,
+              "total_ms": 317.4524320056662,
+              "peak_blocks": 288,
+              "hit_rate": 0.93,
+              "prefill_tokens_computed": 3584
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 39.34483707416803,
+              "warm_ttft_ms": 8.943140041083097,
+              "hit_rate": 0.9,
+              "warm_hit_rate": 0.96
+            },
+            "burst": {
+              "ttft_mean_ms": 82.92048494331539,
+              "ttft_p50_ms": 82.92048494331539,
+              "ttft_max_ms": 82.92048494331539,
+              "total_ms": 317.69044091925025,
+              "peak_blocks": 288,
+              "hit_rate": 0.93,
+              "prefill_tokens_computed": 3584
+            }
+          },
+          {
+            "sequential": {
+              "cold_first_ttft_ms": 39.35387707315385,
+              "warm_ttft_ms": 8.892080979421735,
+              "hit_rate": 0.9,
+              "warm_hit_rate": 0.96
+            },
+            "burst": {
+              "ttft_mean_ms": 83.22205499280244,
+              "ttft_p50_ms": 83.22205499280244,
+              "ttft_max_ms": 83.22205499280244,
+              "total_ms": 316.0378449829295,
+              "peak_blocks": 288,
+              "hit_rate": 0.93,
+              "prefill_tokens_computed": 3584
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
