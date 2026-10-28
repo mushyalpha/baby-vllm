@@ -27,7 +27,7 @@ import torch
 from babyvllm.config import load_model_config
 from babyvllm.kernels.decode_split import (
     DECODE_PARTITION_ENV,
-    DEFAULT_PARTITION_BLOCKS,
+    auto_partition_blocks,
     decode_split_plan,
 )
 from babyvllm.kernels.paged_attn import paged_decode_attention
@@ -59,6 +59,7 @@ def build(batch, ctx, num_layers, num_heads, num_kv_heads, head_dim, block_size,
 
 def time_graph(fn, warmup, iters):
     side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         fn()
     torch.cuda.current_stream().wait_stream(side)
@@ -85,23 +86,27 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--warmup", type=int, default=10)
     ap.add_argument("--iters", type=int, default=50)
+    ap.add_argument("--batches", default=",".join(map(str, BATCHES)))
+    ap.add_argument("--contexts", default=",".join(map(str, CONTEXTS)))
     ap.add_argument("--out", default="decode_attn_bench.json")
     args = ap.parse_args()
+    batches = [int(b) for b in args.batches.split(",")]
+    contexts = [int(c) for c in args.contexts.split(",")]
 
     os.environ.pop(DECODE_PARTITION_ENV, None)
     cfg = load_model_config()
     num_heads, num_kv_heads, head_dim = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
     layers, block_size = cfg.num_hidden_layers, cfg.block_size
-    width = cdiv(max(CONTEXTS), block_size) + 1
+    width = cdiv(max(contexts), block_size) + 1
     scale = head_dim ** -0.5
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     print(f"GPU {torch.cuda.get_device_name(0)}, {sms} SMs, torch {torch.__version__}", flush=True)
     print(f"{num_heads} q heads, {num_kv_heads} kv heads, head dim {head_dim}, {layers} layers, "
-          f"block {block_size}, default partition {DEFAULT_PARTITION_BLOCKS} blocks", flush=True)
+          f"block {block_size}", flush=True)
 
     rows = []
-    for ctx in CONTEXTS:
-        for batch in BATCHES:
+    for ctx in contexts:
+        for batch in batches:
             q, caches, tables, seq_lens = build(
                 batch, ctx, layers, num_heads, num_kv_heads, head_dim, block_size, width,
             )
@@ -153,7 +158,7 @@ def main():
             "sms": sms,
             "torch": torch.__version__,
             "model": os.environ.get("BABYVLLM_MODEL", "Qwen/Qwen2.5-7B"),
-            "default_partition_blocks": DEFAULT_PARTITION_BLOCKS,
+            "auto_partition_blocks": {b: auto_partition_blocks(b) for b in batches},
             "rows": rows,
         }, f, indent=2)
     print(f"Wrote {args.out}", flush=True)

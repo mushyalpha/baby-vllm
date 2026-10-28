@@ -12,23 +12,37 @@ Pure Python so the plan is testable without a GPU.
 import os
 
 # "auto" splits only when batch × KV heads leaves SMs idle, with
-# DEFAULT_PARTITION_BLOCKS pages per split. "0" is always the single-pass
+# auto_partition_blocks(batch) pages per split. "0" is always the single-pass
 # kernel. A positive integer always splits, with that many pages per split.
 # Kept switchable for A/B runs.
 DECODE_PARTITION_ENV = "BABYVLLM_DECODE_PARTITION"
-# The partition is a constant, not derived from the batch or the context
-# bucket, so eager decode and the CUDA graph cut a row at the same pages and
-# return the same bits. A row that fits in one partition matches the
-# single-pass kernel exactly.
-DEFAULT_PARTITION_BLOCKS = 8
+# Below 4 pages per split, the partial writes and the reduce cost more than
+# the extra CTAs return (H100, Qwen2.5-7B, context 2048).
+MIN_PARTITION_BLOCKS = 4
 
 
 def _cdiv(a: int, b: int) -> int:
     return -(-a // b)
 
 
+def _next_pow2(n: int) -> int:
+    return 1 << max(0, n - 1).bit_length()
+
+
+def auto_partition_blocks(batch: int) -> int:
+    """Pages per split. Grows with the batch so a 2048-token step launches a few hundred CTAs.
+
+    Depends only on the batch rounded up to a power of two, never on the
+    context. The CUDA graph batch buckets are powers of two, so eager decode
+    at batch 5 and the batch-8 graph cut a row at the same pages and return
+    the same bits. A row that fits in one partition matches the single-pass
+    kernel exactly.
+    """
+    return max(MIN_PARTITION_BLOCKS, _next_pow2(batch))
+
+
 def grid_fills_gpu(batch: int, n_kv_heads: int, num_sms: int) -> bool:
-    return batch * n_kv_heads >= num_sms
+    return _next_pow2(batch) * n_kv_heads >= num_sms
 
 
 def decode_split_plan(
@@ -53,7 +67,7 @@ def decode_split_plan(
         if env == "auto":
             if grid_fills_gpu(batch, n_kv_heads, num_sms):
                 return 1, ctx_blocks
-            partition_blocks = DEFAULT_PARTITION_BLOCKS
+            partition_blocks = auto_partition_blocks(batch)
         else:
             partition_blocks = int(env)
     if partition_blocks < 0:

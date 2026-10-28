@@ -154,17 +154,18 @@ def test_live_length_and_graph_bucket_give_identical_bits(monkeypatch):
 
 
 @needs_triton
-@pytest.mark.parametrize("n", [1, 17, 64, 127, 128])
+@pytest.mark.parametrize("n", [1, 17, 63, 64])
 def test_row_within_one_partition_matches_single_pass_bits(n):
-    from babyvllm.kernels.decode_split import DEFAULT_PARTITION_BLOCKS
+    from babyvllm.kernels.decode_split import auto_partition_blocks
 
-    assert n <= DEFAULT_PARTITION_BLOCKS * BLOCK_SIZE
+    partition = auto_partition_blocks(2)
+    assert n <= partition * BLOCK_SIZE
     scale = HEAD_DIM ** -0.5
     q, kv_cache, bt, seq_lens = _make_inputs([n, n], width=GRAPH_TABLE_WIDTH, seed=n)
     single = paged_decode_attention(q, kv_cache, bt, seq_lens, scale,
                                     max_seq_len=2048, partition_blocks=0)
     split = paged_decode_attention(q, kv_cache, bt, seq_lens, scale,
-                                   max_seq_len=2048, partition_blocks=DEFAULT_PARTITION_BLOCKS)
+                                   max_seq_len=2048, partition_blocks=partition)
     assert torch.equal(single, split)
 
 
@@ -191,6 +192,7 @@ def test_decode_attention_replays_in_a_cuda_graph(partition_env, monkeypatch):
     run = lambda: paged_decode_attention(q, kv_cache, bt, seq_lens, scale, max_seq_len=2048)
 
     side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         run()
     torch.cuda.current_stream().wait_stream(side)

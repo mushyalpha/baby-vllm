@@ -464,6 +464,8 @@ class ModelRunner:
 
         buf = self._ensure_static_buffers(batch_bucket, ctx_bucket)
         side_stream = torch.cuda.Stream()
+        # The static buffers were just written on the current stream.
+        side_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side_stream):
             for _ in range(warmup_steps):
                 self._forward_static(buf, batch_bucket, ctx_bucket)
