@@ -1,0 +1,83 @@
+{
+  "metadata": {
+    "label": "fp32 round 2",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "model": "Qwen/Qwen2.5-7B",
+    "dtype": "bfloat16",
+    "publishable": true,
+    "batch": 64,
+    "prompt_len": 128,
+    "warmup_steps": 30,
+    "steps": 100,
+    "repeats": 3,
+    "prepare_function": "prepare_decode_inputs",
+    "pytorch_version": "2.13.0+cu130",
+    "command": "python benchmarks/profile_decode_host.py --model Qwen/Qwen2.5-7B --label fp32 round 2 --out results_27Oct2026_H100_argmax/decode_profile_fp32_r2.json"
+  },
+  "ms_per_step": {
+    "wall": {
+      "p50_of_trials": 6.521871546283364,
+      "ci95": 0.00428174746832977
+    },
+    "schedule": {
+      "p50_of_trials": 0.08534197695553303,
+      "ci95": 0.00015644016481516516
+    },
+    "prepare": {
+      "p50_of_trials": 0.060216523706912994,
+      "ci95": 3.532219077581533e-05
+    },
+    "launch": {
+      "p50_of_trials": 0.010001996997743845,
+      "ci95": 5.290641062302293e-05
+    },
+    "update": {
+      "p50_of_trials": 0.013646495062857866,
+      "ci95": 0.0001816739311717645
+    },
+    "rest": {
+      "p50_of_trials": 6.3484805868938565,
+      "ci95": 0.0060994333700958355
+    },
+    "graph_gpu": {
+      "p50_of_trials": 6.269519805908203,
+      "ci95": 0.0030750019427029924
+    },
+    "exposed": {
+      "p50_of_trials": 0.24622062826529145,
+      "ci95": 0.0014944756410484998
+    }
+  },
+  "trials": [
+    {
+      "wall": 6.5156310447491705,
+      "schedule": 0.0852584489621222,
+      "prepare": 0.06020598812028766,
+      "launch": 0.010001996997743845,
+      "update": 0.013646495062857866,
+      "rest": 6.340086343698204,
+      "graph_gpu": 6.266512155532837,
+      "exposed": 0.24548206152394414
+    },
+    {
+      "wall": 6.521871546283364,
+      "schedule": 0.08552847430109978,
+      "prepare": 0.060264545027166605,
+      "launch": 0.009979004971683025,
+      "update": 0.013600976672023535,
+      "rest": 6.3484805868938565,
+      "graph_gpu": 6.2719361782073975,
+      "exposed": 0.24622062826529145
+    },
+    {
+      "wall": 6.522458454128355,
+      "schedule": 0.08534197695553303,
+      "prepare": 0.060216523706912994,
+      "launch": 0.010068994015455246,
+      "update": 0.013898999895900488,
+      "rest": 6.350141018629074,
+      "graph_gpu": 6.269519805908203,
+      "exposed": 0.24804756324738264
+    }
+  ]
+}

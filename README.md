@@ -45,11 +45,37 @@ outputs[0].text
 
 ## Benchmark
 
-Qwen2.5-7B, bf16, one H100 80GB HBM3, 26 October 2026. All three engines ran on the same pod. Prompt 128, 64 new tokens, greedy. Three trials. The point is the median, and the ± is a 95% interval. Throughput includes prefill. Time to first token is a separate one-token generate.
+Qwen2.5-7B, bf16, one H100 80GB HBM3. Each table is one pod with both engines on PyTorch 2.13.0+cu130 and vLLM 0.32.0. 64 new tokens, greedy, three trials. The point is the median, and the ± is a 95% interval. Throughput includes prefill. Time to first token is a separate one-token generate.
 
-baby-vLLM matches vLLM 0.32.0 throughput at batch 64 and is ahead at batch 1, 8 and 32. Its first token arrives sooner at every batch size: 171 ms against 221 ms at batch 64. Greedy tokens match HuggingFace at every batch size.
+27 October 2026, prompt 128, after the decode host fix (greedy argmax inside the CUDA graph, decode inputs edited in place). baby-vLLM is ahead at every batch, and greedy tokens match HuggingFace.
 
-Tokens per second. Prefill is included.
+| Tokens/s | Batch 1 | Batch 8 | Batch 32 | Batch 64 |
+|---|---:|---:|---:|---:|
+| baby-vLLM | 169.4 ± 0.4 | 1,283 ± 1 | 4,319 ± 11 | 6,969 ± 21 |
+| vLLM 0.32.0 | 167.3 ± 0.1 | 1,203 ± 18 | 4,261 ± 50 | 6,882 ± 52 |
+| First token, baby-vLLM (ms) | 9.7 | 21.6 | 82.8 | 168.6 |
+| First token, vLLM (ms) | 9.8 | 31.4 | 100.1 | 184.8 |
+
+28 October 2026, prompt 1,920, with flash-decoding (decode attention split along the sequence when the batch leaves SMs idle). Greedy tokens are identical to vLLM's for every sequence. Batch 64 is the one cell where vLLM is clearly ahead, mostly in the first token.
+
+| Tokens/s | Batch 1 | Batch 8 | Batch 64 |
+|---|---:|---:|---:|
+| baby-vLLM, single-pass decode attention | 119.0 ± 7.8 | 603 ± 25 | 1,132 ± 20 |
+| baby-vLLM, flash-decoding (default) | 149.3 ± 0.1 | 672 ± 29 | 1,136 ± 22 |
+| vLLM 0.32.0 | 149.3 ± 0.3 | 694 ± 18 | 1,257 ± 8 |
+| First token, baby-vLLM (ms) | 45.4 | 350.5 | 2,903 |
+| First token, vLLM (ms) | 47.4 | 335.5 | 2,689 |
+
+Prefix caching (`enable_prefix_caching=True`, off by default), 27 October: with a 1,536-token shared system prompt, the first token goes from 40.6 to 8.9 ms, and a burst of 32 requests needs 288 KV blocks instead of 3,264.
+
+```bash
+bash benchmarks/run_h100_decode_and_prefix.sh   # 27 October
+bash benchmarks/run_h100_flash_decode.sh        # 28 October
+```
+
+### 26 October, before the decode host fix
+
+Prompt 128. baby-vLLM matched vLLM 0.32.0 throughput at batch 64 and was ahead at batch 1, 8 and 32. Tokens per second, prefill included:
 
 | Engine | Batch 1 | Batch 8 | Batch 32 | Batch 64 |
 |---|---:|---:|---:|---:|
@@ -67,7 +93,7 @@ Time to first token, milliseconds.
 
 HuggingFace's first throughput trial was still cold, so that row is the median only. PyTorch 2.13.0+cu130, vLLM 0.32.0, transformers 5.19.0. Prefix caching was off in both engines. Chunked prefill stayed at vLLM's default. Sequences stop at 192 tokens, so this does not exercise long-context attention.
 
-baby-vLLM wins on prefill and still loses on decode. At batch 64, generate time minus time to first token is about 450 ms for baby-vLLM and about 400 ms for vLLM, roughly 0.8 ms per decode step.
+On 26 October baby-vLLM won on prefill and lost on decode, about 0.8 ms per step at batch 64. The 27 October host fix is what closed that.
 
 ```bash
 bash benchmarks/run_h100_comparison.sh Qwen/Qwen2.5-7B 1,8,32,64 128 64
@@ -115,4 +141,6 @@ Every shape launches the same 329 kernels. The matmuls stay near 5.1–5.4 ms. W
 
 The long batch-64 prefill is chunked at 8,192 tokens. A single step of 64 × 1,920 tokens asks the gate/up projection for an 8.67 GiB activation, and the KV cache had already left only about 4 GiB free. Decode itself stays on the CUDA graph.
 
-The write-up of the engine, the fusions, and what to build next is `kernel_fusion_report/baby_vllm_report.md`.
+This table is the Day 7 engine on PyTorch 2.8. On 28 October, after the decode host fix and flash-decoding, on PyTorch 2.13, the same cells are 5.871, 5.953, 6.621 and 9.094 ms. Near length 2048 at batch 1, decode attention went from 2.15 to 0.27 ms per step.
+
+The write-up of the engine, the fusions, and what is left (FP8 weights, then tensor parallelism at TP = 2) is `kernel_fusion_report/baby_vllm_report.md`. The PDF is `kernel_fusion_report/Baby_vLLM.pdf`. One row per day is in `BENCHMARKS.md`.

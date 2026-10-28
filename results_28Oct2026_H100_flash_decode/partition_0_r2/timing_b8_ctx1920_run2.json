@@ -1,0 +1,21 @@
+{
+  "model": "Qwen/Qwen2.5-7B",
+  "batch": 8,
+  "context": 1920,
+  "prompt_len": 1920,
+  "seq_len_first": 1951,
+  "seq_len_last": 2048,
+  "compile": false,
+  "cuda_graphs": true,
+  "graphs_precaptured": true,
+  "decode_steps": 98,
+  "warmup_steps": 30,
+  "steps": 98,
+  "step_ms_p50": 7.951211999170482,
+  "step_ms_mean": 7.976729510119185,
+  "step_ms_std": 0.16924642335208098,
+  "step_ms_min": 7.888180996815208,
+  "step_ms_max": 9.58167199860327,
+  "tok_s": 1006.1359200125223,
+  "repeat": 2
+}

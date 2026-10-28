@@ -1,0 +1,34 @@
+{
+  "measured_steps": 30,
+  "avg_kernels_per_step": 353.0,
+  "active_gpu_kernel_time_ms": 7.672032866666667,
+  "avg_active_ms_per_step": 7.672032866666667,
+  "nsys_nvtx_window_ms": 8.132591433333321,
+  "idle_ms_nsys": {
+    "pre_launch": 0.05316283333333334,
+    "in_graph_idle": 0.36375779999998775,
+    "tail": 0.04363793333333332
+  },
+  "breakdown_per_step": {
+    "memory": {
+      "count": 36.0,
+      "ms": 0.030239633333333335
+    },
+    "elementwise": {
+      "count": 148.0,
+      "ms": 0.26614993333333337
+    },
+    "GEMM": {
+      "count": 141.0,
+      "ms": 5.243866533333334
+    },
+    "attention": {
+      "count": 28.0,
+      "ms": 2.1317767666666665
+    }
+  },
+  "timing_json": "results_28Oct2026_H100_flash_decode/partition_0_r2/timing_b1_ctx2048.json",
+  "clean_wall_p50_ms": 7.800373999392225,
+  "clean_wall_p50_ci95_ms": 0.07347210724790673,
+  "clean_scheduling_overhead_ms": 0.12834113272555836
+}
