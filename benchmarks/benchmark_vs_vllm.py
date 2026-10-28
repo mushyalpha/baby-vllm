@@ -1016,6 +1016,7 @@ def main():
             "hf_version": package_version("transformers"),
             "pytorch_version": torch.__version__,
             "babyvllm_prefill_attn": os.environ.get("BABYVLLM_PREFILL_ATTN", "triton"),
+            "babyvllm_decode_partition": os.environ.get("BABYVLLM_DECODE_PARTITION", "auto"),
             "command": cmd_str,
             "vllm": vllm_meta,
             "definition": {

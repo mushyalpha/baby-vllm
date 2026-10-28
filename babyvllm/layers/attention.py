@@ -53,7 +53,8 @@ class Attention(nn.Module):
         md = ctx.attn_metadata
         if md.max_query_len == 1 and q.is_cuda and self.kv_cache.shape[2] >= 16:
             from babyvllm.kernels.paged_attn import paged_decode_attention
-            return paged_decode_attention(q, self.kv_cache, md.block_tables, md.seq_lens, self.scale)
+            return paged_decode_attention(q, self.kv_cache, md.block_tables, md.seq_lens,
+                                          self.scale, max_seq_len=md.max_seq_len)
         if md.max_query_len > 1 and q.is_cuda and _PREFILL_BACKEND == "triton":
             from babyvllm.kernels.paged_prefill import paged_prefill_attention
             return paged_prefill_attention(q, self.kv_cache, md, self.scale)
